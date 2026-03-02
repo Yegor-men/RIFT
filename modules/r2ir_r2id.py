@@ -3,8 +3,6 @@ from torch import nn
 
 
 class MultiHeadLinearAttention(nn.Module):
-    """Stable multi-head linear attention — works at any resolution, any Nq != Nk."""
-
     def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0):
         super().__init__()
         assert embed_dim % num_heads == 0, f"embed_dim {embed_dim} must be divisible by num_heads {num_heads}"

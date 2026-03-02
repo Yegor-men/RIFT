@@ -1,4 +1,3 @@
-import matplotlib.pyplot as plt
 import torch
 from modules.alpha_bar import alpha_bar_cosine
 from modules.render_image import render_image
@@ -43,11 +42,11 @@ text_encoder = DummyTextCond(
     d_channels=r2id.d_channels
 ).to(device)
 
-from save_load_model import load_checkpoint_into
+from modules.save_load_model import load_checkpoint_into
 
 r2ir = load_checkpoint_into(r2ir, "models/_E40_0.01037_autoencoder_20260301_194643.pt", "cuda")
-text_encoder = load_checkpoint_into(text_encoder, "models/_E40_0.01293_text_embedding_20260301_215936.pt")
-r2id = load_checkpoint_into(r2id, "models/_E40_0.01293_diffusion_20260301_215936.pt", "cuda")
+text_encoder = load_checkpoint_into(text_encoder, "models/_E40_0.01263_text_embedding_20260302_021117.pt")
+r2id = load_checkpoint_into(r2id, "models/_E40_0.01263_diffusion_20260302_021117.pt", "cuda")
 
 r2ir.eval()
 r2id.eval()
@@ -63,11 +62,11 @@ def uninvert_image(image):
 
 
 with torch.no_grad():
-    batch_size = 100
+    batch_size = 1
 
     if batch_size == 1:
         positive_label = torch.zeros(1, 10)
-        positive_label[0][1] = 1
+        positive_label[0][9] = 1
     if batch_size == 10:
         positive_label = torch.eye(10).to(device)
     if batch_size == 100:
@@ -81,26 +80,26 @@ with torch.no_grad():
     null_text_cond = text_encoder(torch.zeros_like(positive_label))
 
     sizes = [
-        (10, 10, "10px"),
-        (16, 16, "16px"),
-        (28, 28, "28px"),
-        (32, 32, "32px"),
-        (24, 30, "4_5"),
-        (30, 24, "5_4"),
-        (32, 24, "4_3"),
-        (24, 32, "3_4"),
-        (18, 27, "2_3"),
-        (27, 18, "3_2"),
-        (24, 40, "2_5"),
-        (40, 24, "5_2"),
-        (18, 32, "9_16"),
-        (32, 18, "16_9"),
-        (64, 64, "64px"),
-        # (256, 256, "1024px"),  # comment out because vram
+        # (10, 10, "10px"),
+        # (16, 16, "16px"),
+        # (28, 28, "28px"),
+        # (32, 32, "32px"),
+        # (24, 30, "4_5"),
+        # (30, 24, "5_4"),
+        # (32, 24, "4_3"),
+        # (24, 32, "3_4"),
+        # (18, 27, "2_3"),
+        # (27, 18, "3_2"),
+        # (24, 40, "2_5"),
+        # (40, 24, "5_2"),
+        # (18, 32, "9_16"),
+        # (32, 18, "16_9"),
+        # (64, 64, "64px"),
+        (1024, 1024, "1024px"),  # comment out because vram
     ]
 
-    for lat_w in (4, 6, 8, 10):
-        for lat_h in (4, 6, 8, 10):
+    for lat_w in [256]:
+        for lat_h in [256]:
             grid_noise = torch.randn(batch_size, r2ir.lat_channels, lat_h, lat_w).to(device)
 
             final_x0_hat, final_x = run_ddim_visualization(
@@ -122,5 +121,5 @@ with torch.no_grad():
                     tensor=diffused_image,
                     title=f"{name} - Latent H:{lat_h}, W:{lat_w} - Image H:{height}, W:{width}",
                     name=filename,
-                    save=True,
+                    save=False,
                 )

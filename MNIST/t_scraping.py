@@ -52,39 +52,52 @@ test_dloader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Cuda is available: {torch.cuda.is_available()}")
 
-from modules.r2id import R2ID
+from modules.r2ir_r2id import R2ID, R2IR
 from modules.dummy_textencoder import DummyTextCond
 
-model = R2ID(
-    c_channels=1,
-    d_channels=256,
-    rescale_factor=8,
+r2ir = R2IR(
+    col_channels=1,
+    lat_channels=64,
+    embed_dim=128 + 64,
+    pos_high_freq=10,
+    pos_low_freq=6,
+    enc_blocks=4,
+    dec_blocks=4,
+    num_heads=6,
+    mha_dropout=0.1,
+    ffn_dropout=0.2,
+).to(device)
+
+r2id = R2ID(
+    c_channels=r2ir.lat_channels,
+    d_channels=128 + r2ir.lat_channels,
     enc_blocks=8,
     dec_blocks=8,
-    num_heads=8,
-    pos_high_freq=2,
-    pos_low_freq=3,
+    num_heads=6,
+    pos_high_freq=10,
+    pos_low_freq=6,
     time_high_freq=7,
     time_low_freq=3,
-    film_dim=256,
-    axial_dropout=0.1,
-    cross_dropout=0.1,
+    film_dim=128,
+    self_attn_dropout=0.1,
+    cross_attn_dropout=0.1,
     ffn_dropout=0.2,
-    share_weights=False,
 )
 
 text_encoder = DummyTextCond(
-    token_sequence_length=1,
-    d_channels=model.d_channels
+    token_sequence_length=2,
+    d_channels=r2id.d_channels
 )
 
-from save_load_model import load_checkpoint_into
+from modules.save_load_model import load_checkpoint_into
 
-model = load_checkpoint_into(model, "models/E60_0.01078_diffusion_20251224_175855.pt", "cuda")
-text_encoder = load_checkpoint_into(text_encoder, "models/E60_0.01078_text_embedding_20251224_175855.pt")
+r2ir = load_checkpoint_into(r2ir, "models/_E40_0.01037_autoencoder_20260301_194643.pt", "cuda")
+text_encoder = load_checkpoint_into(text_encoder, "models/_E40_0.01263_text_embedding_20260302_021117.pt")
+r2id = load_checkpoint_into(r2id, "models/_E40_0.01263_diffusion_20260302_021117.pt", "cuda")
 
-model.to(device)
-model.eval()
+r2ir.eval()
+r2id.to(device)
+r2id.eval()
 
 text_encoder.to(device)
 text_encoder.eval()
@@ -94,6 +107,15 @@ from modules.alpha_bar import alpha_bar_cosine
 from modules.corrupt_image import corrupt_image
 from tqdm import tqdm
 import numpy as np
+
+
+def invert_image(image):
+    return (image - 0.5) * 2.0
+
+
+def uninvert_image(image):
+    return (image / 2.0) + 0.5
+
 
 max_num = 500
 
@@ -107,8 +129,8 @@ with torch.no_grad():
     for t in tqdm(t_range, total=max_num, desc="Scraping"):
         image, label = next(iter(train_dloader))
         b, c, h, w = image.shape
-        image, label = image.to(device), label.to(device)
-        image = image * 2.0 - 1.0
+        image, label = invert_image(image).to(device), label.to(device)
+        image = r2ir.encode(image, width=8, height=8)
 
         alpha_bar = alpha_bar_cosine(torch.ones(b) * t).to(device)
         noisy_image, eps = corrupt_image(image, alpha_bar)
@@ -117,7 +139,7 @@ with torch.no_grad():
         null_cond = text_encoder(torch.zeros_like(label)).to(device)
         cond_list = [pos_cond, null_cond]
 
-        predicted_eps_list = model(noisy_image, alpha_bar, cond_list)
+        predicted_eps_list = r2id(noisy_image, alpha_bar, cond_list)
         eps_pos, eps_null = predicted_eps_list[0], predicted_eps_list[1]
 
         null_loss = nn.functional.mse_loss(eps_null, eps)
