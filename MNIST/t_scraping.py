@@ -53,7 +53,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Cuda is available: {torch.cuda.is_available()}")
 
 from modules.r2ir_r2id import R2ID, R2IR
-from modules.dummy_textencoder import DummyTextCond
+from MNIST.dummy_textencoder import DummyTextCond
 
 r2ir = R2IR(
     col_channels=1,
@@ -89,7 +89,7 @@ text_encoder = DummyTextCond(
     d_channels=r2id.d_channels
 )
 
-from modules.save_load_model import load_checkpoint_into
+from MNIST.save_load_model import load_checkpoint_into
 
 r2ir = load_checkpoint_into(r2ir, "models/_E40_0.01037_autoencoder_20260301_194643.pt", "cuda")
 text_encoder = load_checkpoint_into(text_encoder, "models/_E40_0.01263_text_embedding_20260302_021117.pt")

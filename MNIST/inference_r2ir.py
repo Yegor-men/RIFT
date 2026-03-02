@@ -3,7 +3,6 @@ import torch
 torch.manual_seed(0)
 torch.cuda.manual_seed(0)
 
-import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
@@ -67,7 +66,7 @@ model = R2IR(
 
 model.print_model_summary()
 
-from modules.save_load_model import load_checkpoint_into
+from MNIST.save_load_model import load_checkpoint_into
 
 model = load_checkpoint_into(model, "models/_E40_0.01037_autoencoder_20260301_194643.pt", "cuda")
 
