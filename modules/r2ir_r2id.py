@@ -117,7 +117,7 @@ class PosEmbed2d(nn.Module):
         grid = torch.stack([xx, yy], dim=0)
         return grid
 
-    def forward(self, batch_size: int, h: int, w: int, relative: bool):
+    def make_grid(self, batch_size: int, h: int, w: int, relative: bool):
         base_grid = self._make_grid(h, w, relative)
         base_grid = base_grid.to(self.frequencies.device)  # [2, h, w]
 
@@ -151,6 +151,12 @@ class PosEmbed2d(nn.Module):
         positional_embedding = self.norm(fourier_ch)  # [b, 4F, h, w]
 
         return positional_embedding
+
+    def forward(self, batch_size: int, h: int, w: int):
+        rel_pos_map = self.make_grid(batch_size, h, w, True)
+        abs_pos_map = self.make_grid(batch_size, h, w, False)
+        pos_map = torch.cat([rel_pos_map, abs_pos_map], dim=-3)
+        return pos_map
 
 
 class ContTimeEmbed(nn.Module):
@@ -533,11 +539,6 @@ class R2IR(nn.Module):
             print(f"\tEncoder Blocks: {count_params(self.enc_blocks):,}")
             print(f"\tDecoder Blocks: {count_params(self.dec_blocks):,}")
 
-    def _get_pos(self, b: int, h: int, w: int):
-        rel = self.pos_embed(b, h, w, relative=True)
-        abs = self.pos_embed(b, h, w, relative=False)
-        return torch.cat([rel, abs], dim=1)  # [B, 2*pos_dim, H, W]
-
     def encode(self, image, scale: int = 2, height: int = None, width: int = None):
         b, _, ih, iw = image.shape
         if height is None or width is None:
@@ -546,11 +547,11 @@ class R2IR(nn.Module):
         lh, lw = height, width
 
         # Input tokens (color + pos) — keep 4D
-        pos = self._get_pos(b, ih, iw)
+        pos = self.pos_embed(b, ih, iw)
         stacked = torch.cat([image, pos], dim=1)
         input_tokens = self.color_to_embed_proj(stacked)  # [B, embed_dim, ih, iw]
 
-        latent_pos_map = self._get_pos(b, lh, lw)
+        latent_pos_map = self.pos_embed(b, lh, lw)
         latent_queries = self.pos_to_embed_proj(latent_pos_map)  # [B, embed_dim, lh, lw]
 
         for enc_block in self.enc_blocks:
@@ -567,11 +568,11 @@ class R2IR(nn.Module):
         ih, iw = height, width
 
         # Latent tokens (latent_color + pos) — keep 4D
-        latent_pos_map = self._get_pos(b, lh, lw)
+        latent_pos_map = self.pos_embed(b, lh, lw)
         stacked = torch.cat([latent, latent_pos_map], dim=1)
         latent_tokens = self.latent_to_embed_proj(stacked)  # [B, embed_dim, lh, lw]
 
-        out_pos_map = self._get_pos(b, ih, iw)
+        out_pos_map = self.pos_embed(b, ih, iw)
         out_queries = self.pos_to_embed_proj(out_pos_map)  # [B, embed_dim, ih, iw]
 
         for dec_block in self.dec_blocks:
@@ -664,9 +665,7 @@ class R2ID(nn.Module):
         time_vector = self.time_embed(alpha_bar)  # [B, time_dim]
         film_vector = self.film_proj(time_vector)
 
-        rel_pos_map = self.pos_embed(b, h, w, True)
-        abs_pos_map = self.pos_embed(b, h, w, False)
-        pos_map = torch.cat([rel_pos_map, abs_pos_map], dim=-3)
+        pos_map = self.pos_embed(b, h, w)
 
         stacked_latent = torch.cat([image, pos_map], dim=-3)
         latent = self.proj_to_latent(stacked_latent)
