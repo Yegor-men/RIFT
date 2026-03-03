@@ -365,8 +365,8 @@ for E in range(num_epochs):
 
     # MODEL SAVING
     if (E + 1) % 1 == 0 or E == num_epochs:
-        model_path = save_model(ema_r2id, name=f"E{E + 1}_{test_loss:.5f}_diffusion")
-        text_encoder_path = save_model(text_encoder, name=f"E{E + 1}_{test_loss:.5f}_text_embedding")
+        model_path = save_model(ema_r2id, name=f"E{E + 1}_{test_loss:.5f}_MNIST_R2ID")
+        text_encoder_path = save_model(text_encoder, name=f"E{E + 1}_{test_loss:.5f}_MNIST_TEXT")
         time.sleep(0.2)
 
 # ======================================================================================================================

@@ -191,4 +191,4 @@ for E in range(num_epochs):
     plt.legend()
     plt.show()
 
-    model_path = save_model(ema_model, name=f"E{E + 1}_{test_loss_sum:.5f}_R2IR")
+    model_path = save_model(ema_model, name=f"E{E + 1}_{test_loss_sum:.5f}_MNIST_R2IR")
