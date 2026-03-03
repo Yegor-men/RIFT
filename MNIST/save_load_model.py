@@ -1,29 +1,24 @@
 import os
-import torch
 from datetime import datetime
+from safetensors.torch import save_file, load_file
 
 
-def save_checkpoint(model: torch.nn.Module, folder: str = "models", prefix: str = "s2ir"):
-    """
-    Save model.state_dict() into `folder` with a timestamped filename.
-    Returns the saved path.
-    """
+def save_model(model, name: str, folder: str = "models"):
     os.makedirs(folder, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fname = f"{prefix}_{ts}.pt"
-    path = os.path.join(folder, fname)
-    torch.save(model.state_dict(), path)
-    print(f"Saved checkpoint: {path}")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    filename = f"{name}_{timestamp}.safetensors"
+    path = os.path.join(folder, filename)
+
+    save_file(model.state_dict(), path)
+    print(f"Saved model to {path}")
     return path
 
 
-def load_checkpoint_into(model: torch.nn.Module, path: str, device=None):
-    """
-    Load a state dict into an existing model instance.
-    Model must be already instantiated with the correct config.
-    """
-    map_location = device if device is not None else torch.device("cpu")
-    sd = torch.load(path, map_location=map_location)
-    model.load_state_dict(sd)
-    print(f"Loaded checkpoint from: {path}")
+def load_model(model, name: str, folder: str = "models"):
+    path = os.path.join(folder, name)
+    state_dict = load_file(path)
+    model.load_state_dict(state_dict)
+    print(f"Loaded model from {path}")
     return model
