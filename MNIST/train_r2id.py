@@ -50,7 +50,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Cuda is available: {torch.cuda.is_available()}")
 
 from modules.r2ir_r2id import R2IR, R2ID
-from MNIST.dummy_textencoder import DummyTextCond
+from dummy_textencoder import DummyTextCond
 
 r2ir = R2IR(
     col_channels=1,

@@ -6,7 +6,7 @@ from modules.run_ddim_visualization import run_ddim_visualization
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 from modules.r2ir_r2id import R2ID, R2IR
-from MNIST.dummy_textencoder import DummyTextCond
+from dummy_textencoder import DummyTextCond
 
 r2ir = R2IR(
     col_channels=1,
