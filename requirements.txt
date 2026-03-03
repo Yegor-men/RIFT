@@ -2,3 +2,5 @@ torch
 torchvision
 matplotlib
 safetensors
+huggingface_hub
+tqdm
