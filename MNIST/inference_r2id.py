@@ -66,7 +66,8 @@ def uninvert_image(image):
 
 
 with torch.no_grad():
-    batch_size = 1
+    batch_size = 100
+    latent_sizes = [4, 6, 8, 10]
 
     if batch_size == 1:
         positive_label = torch.zeros(1, 10)
@@ -84,26 +85,26 @@ with torch.no_grad():
     null_text_cond = text_encoder(torch.zeros_like(positive_label))
 
     sizes = [
-        # (10, 10, "10px"),
-        # (16, 16, "16px"),
-        # (28, 28, "28px"),
-        # (32, 32, "32px"),
-        # (24, 30, "4_5"),
-        # (30, 24, "5_4"),
-        # (32, 24, "4_3"),
-        # (24, 32, "3_4"),
-        # (18, 27, "2_3"),
-        # (27, 18, "3_2"),
-        # (24, 40, "2_5"),
-        # (40, 24, "5_2"),
-        # (18, 32, "9_16"),
-        # (32, 18, "16_9"),
-        # (64, 64, "64px"),
-        (1024, 1024, "1024px"),  # comment out because vram
+        (10, 10, "10px"),
+        (16, 16, "16px"),
+        (28, 28, "28px"),
+        (32, 32, "32px"),
+        (24, 30, "4_5"),
+        (30, 24, "5_4"),
+        (32, 24, "4_3"),
+        (24, 32, "3_4"),
+        (18, 27, "2_3"),
+        (27, 18, "3_2"),
+        (24, 40, "2_5"),
+        (40, 24, "5_2"),
+        (18, 32, "9_16"),
+        (32, 18, "16_9"),
+        (64, 64, "64px"),
+        # (1024, 1024, "1024px"),  # Change batch_size to 1
     ]
 
-    for lat_w in [256]:
-        for lat_h in [256]:
+    for lat_w in latent_sizes:
+        for lat_h in latent_sizes:
             grid_noise = torch.randn(batch_size, r2ir.lat_channels, lat_h, lat_w).to(device)
 
             final_x0_hat, final_x = run_ddim_visualization(
@@ -125,5 +126,5 @@ with torch.no_grad():
                     tensor=diffused_image,
                     title=f"{name} - Latent H:{lat_h}, W:{lat_w} - Image H:{height}, W:{width}",
                     name=filename,
-                    save=False,
+                    save=True,
                 )
