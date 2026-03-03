@@ -3,9 +3,9 @@ import os
 from huggingface_hub import hf_hub_download
 
 REPO_ID = "yegor-men/resolution-invariant-image-diffuser"
-R2IR_filename = "MNIST/MNIST_R2IR.safetensors"
-R2ID_filename = "MNIST/MNIST_R2ID.safetensors"
-TEXT_filename = "MNIST/MNIST_TEXT.safetensors"
+R2IR_filename = "MNIST_R2IR.safetensors"
+R2ID_filename = "MNIST_R2ID.safetensors"
+TEXT_filename = "MNIST_TEXT.safetensors"
 
 LOCAL_DIR = "models"
 
