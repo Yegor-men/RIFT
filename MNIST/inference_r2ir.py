@@ -69,7 +69,7 @@ model.print_model_summary()
 
 from save_load_model import save_model, load_model
 
-model = load_model(model, "MNIST_R2ID.safetensors")
+model = load_model(model, "MNIST_R2IR.safetensors")
 
 
 def invert_image(image):

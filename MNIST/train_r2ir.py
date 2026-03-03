@@ -72,7 +72,7 @@ print(f"Latent size: {lat_size:,} | Total values: {lat_values:,} | Image to Late
 
 model.print_model_summary()
 
-# model = load_model(model, "MNIST_R2ID.safetensors")
+# model = load_model(model, "MNIST_R2IR.safetensors")
 
 model = model.to(device)
 
