@@ -14,12 +14,12 @@ r2ir = R2IR(
     embed_dim=128 + 64,
     pos_high_freq=10,
     pos_low_freq=6,
-    enc_blocks=4,
-    dec_blocks=4,
+    enc_blocks=2,
+    dec_blocks=2,
     num_heads=6,
     mha_dropout=0.1,
     ffn_dropout=0.2,
-).to(device)
+)
 
 r2id = R2ID(
     c_channels=r2ir.lat_channels,
@@ -35,22 +35,26 @@ r2id = R2ID(
     self_attn_dropout=0.1,
     cross_attn_dropout=0.1,
     ffn_dropout=0.2,
-).to(device)
+)
 
 text_encoder = DummyTextCond(
     token_sequence_length=2,
     d_channels=r2id.d_channels
-).to(device)
+)
 
-from MNIST.save_load_model import load_checkpoint_into
+from save_load_model import save_model, load_model
 
-r2ir = load_checkpoint_into(r2ir, "models/_E40_0.01037_autoencoder_20260301_194643.pt", "cuda")
-text_encoder = load_checkpoint_into(text_encoder, "models/_E40_0.01263_text_embedding_20260302_021117.pt")
-r2id = load_checkpoint_into(r2id, "models/_E40_0.01263_diffusion_20260302_021117.pt", "cuda")
+r2ir = load_model(r2ir, "MNIST_R2IR.safetensors")
+text_encoder = load_model(text_encoder, "MNIST_TEXT.safetensors")
+r2id = load_model(r2id, "MNIST_R2ID.safetensors")
+
+r2ir = r2ir.to(device)
+text_encoder = text_encoder.to(device)
+r2id = r2id.to(device)
 
 r2ir.eval()
-r2id.eval()
 text_encoder.eval()
+r2id.eval()
 
 
 def invert_image(image):

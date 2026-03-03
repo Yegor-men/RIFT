@@ -4,7 +4,6 @@ import matplotlib.pyplot as plt
 import torch
 from torch import nn
 import numpy as np
-from MNIST.save_load_model import save_checkpoint
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
@@ -59,12 +58,12 @@ r2ir = R2IR(
     embed_dim=128 + 64,
     pos_high_freq=10,
     pos_low_freq=6,
-    enc_blocks=4,
-    dec_blocks=4,
+    enc_blocks=2,
+    dec_blocks=2,
     num_heads=6,
     mha_dropout=0.1,
     ffn_dropout=0.2,
-).to(device)
+)
 r2ir.print_model_summary()
 
 r2id = R2ID(
@@ -81,20 +80,24 @@ r2id = R2ID(
     self_attn_dropout=0.1,
     cross_attn_dropout=0.1,
     ffn_dropout=0.2,
-).to(device)
+)
 lat_w, lat_h = 4, 4
 r2id.print_model_summary()
 
 text_encoder = DummyTextCond(
     token_sequence_length=2,
     d_channels=r2id.d_channels
-).to(device)
+)
 
-from MNIST.save_load_model import load_checkpoint_into
+from save_load_model import save_model, load_model
 
-r2ir = load_checkpoint_into(r2ir, "models/_E40_0.01037_autoencoder_20260301_194643.pt", "cuda")
-# text_encoder = load_checkpoint_into(text_encoder, "models/E20_0.04429_text_embedding_20260224_161135.pt")
-# r2id = load_checkpoint_into(r2id, "models/E20_0.04429_diffusion_20260224_161134.pt", "cuda")
+r2ir = load_model(r2ir, "MNIST_R2IR.safetensors")
+# text_encoder = load_model(text_encoder, "MNIST_TEXT.safetensors")
+# r2id = load_model(r2id, "MNIST_R2ID.safetensors")
+
+r2ir = r2ir.to(device)
+text_encoder = text_encoder.to(device)
+r2id = r2id.to(device)
 
 r2ir.eval()
 
@@ -362,8 +365,8 @@ for E in range(num_epochs):
 
     # MODEL SAVING
     if (E + 1) % 1 == 0 or E == num_epochs:
-        model_path = save_checkpoint(ema_r2id, prefix=f"E{E + 1}_{test_loss:.5f}_diffusion")
-        text_encoder_path = save_checkpoint(text_encoder, prefix=f"E{E + 1}_{test_loss:.5f}_text_embedding")
+        model_path = save_model(ema_r2id, name=f"E{E + 1}_{test_loss:.5f}_diffusion")
+        text_encoder_path = save_model(text_encoder, name=f"E{E + 1}_{test_loss:.5f}_text_embedding")
         time.sleep(0.2)
 
 # ======================================================================================================================

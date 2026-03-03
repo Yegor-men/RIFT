@@ -1,6 +1,6 @@
-import matplotlib.pyplot as plt
 import torch
-from MNIST.save_load_model import save_checkpoint
+import matplotlib.pyplot as plt
+from save_load_model import save_model, load_model
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
@@ -58,12 +58,12 @@ model = R2IR(
     embed_dim=128 + 64,
     pos_high_freq=10,
     pos_low_freq=6,
-    enc_blocks=4,
-    dec_blocks=4,
+    enc_blocks=2,
+    dec_blocks=2,
     num_heads=6,
     mha_dropout=0.1,
     ffn_dropout=0.2,
-).to(device)
+)
 r2ir_scale = 8
 lat_size = image_size // r2ir_scale
 lat_values = model.lat_channels * lat_size ** 2
@@ -72,9 +72,9 @@ print(f"Latent size: {lat_size:,} | Total values: {lat_values:,} | Image to Late
 
 model.print_model_summary()
 
-# from save_load_model import load_checkpoint_into
-#
-# model = load_checkpoint_into(model, "models/_E40_0.07420_autoencoder_20260226_140527.pt", "cuda")
+# model = load_model(model, "MNIST_R2ID.safetensors")
+
+model = model.to(device)
 
 import copy
 
@@ -191,4 +191,4 @@ for E in range(num_epochs):
     plt.legend()
     plt.show()
 
-    model_path = save_checkpoint(ema_model, prefix=f"E{E + 1}_{test_loss_sum:.5f}_autoencoder")
+    model_path = save_model(ema_model, name=f"E{E + 1}_{test_loss_sum:.5f}_R2IR")

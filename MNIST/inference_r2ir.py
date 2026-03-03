@@ -6,6 +6,7 @@ torch.cuda.manual_seed(0)
 import torch
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+import matplotlib.pyplot as plt
 
 
 def one_hot_encode(label):
@@ -57,18 +58,18 @@ model = R2IR(
     embed_dim=128 + 64,
     pos_high_freq=10,
     pos_low_freq=6,
-    enc_blocks=4,
-    dec_blocks=4,
+    enc_blocks=2,
+    dec_blocks=2,
     num_heads=6,
     mha_dropout=0.1,
     ffn_dropout=0.2,
-).to(device)
+)
 
 model.print_model_summary()
 
-from MNIST.save_load_model import load_checkpoint_into
+from save_load_model import save_model, load_model
 
-model = load_checkpoint_into(model, "models/_E40_0.01037_autoencoder_20260301_194643.pt", "cuda")
+model = load_model(model, "MNIST_R2ID.safetensors")
 
 
 def invert_image(image):
@@ -81,8 +82,11 @@ def uninvert_image(image):
 
 from tqdm import tqdm
 
+model = model.to(device)
 model.eval()
+
 test_loss_sum = 0.0
+render_latent = False
 for i, (image, label) in tqdm(enumerate(test_dloader), total=len(test_dloader), desc="TEST"):
     with torch.no_grad():
         image = invert_image(image).to(device)
@@ -94,29 +98,29 @@ for i, (image, label) in tqdm(enumerate(test_dloader), total=len(test_dloader), 
             render_image(uninvert_image(image))
             render_image(uninvert_image(recon_img), f"LOSS: {loss}")
 
-            # Render latent channels in a grid: rows=channels, columns=batch
-            # lat_img_uninverted = uninvert_image(lat_img)
-            # B, C, H, W = lat_img_uninverted.shape
-            #
-            # fig, axes = plt.subplots(C, B, figsize=(B * 2, C * 2))
-            #
-            # for batch_idx in range(B):
-            #     for channel_idx in range(C):
-            #         ax = axes[channel_idx, batch_idx] if C > 1 else axes[batch_idx]
-            #         channel_img = lat_img_uninverted[batch_idx, channel_idx].cpu()
-            #         ax.imshow(channel_img, cmap='gray')
-            #
-            #         # Add labels only on edges to avoid clutter
-            #         if channel_idx == 0:
-            #             ax.set_title(f"Batch {batch_idx}")
-            #         if batch_idx == 0:
-            #             ax.set_ylabel(f"Ch {channel_idx}")
-            #
-            #         ax.axis('off')
-            #
-            # plt.suptitle("Latent Representation (Channels × Batch)")
-            # plt.tight_layout()
-            # plt.show()
+            if render_latent:
+                lat_img_uninverted = uninvert_image(lat_img)
+                B, C, H, W = lat_img_uninverted.shape
+
+                fig, axes = plt.subplots(C, B, figsize=(B * 2, C * 2))
+
+                for batch_idx in range(B):
+                    for channel_idx in range(C):
+                        ax = axes[channel_idx, batch_idx] if C > 1 else axes[batch_idx]
+                        channel_img = lat_img_uninverted[batch_idx, channel_idx].cpu()
+                        ax.imshow(channel_img, cmap='gray')
+
+                        # Add labels only on edges to avoid clutter
+                        if channel_idx == 0:
+                            ax.set_title(f"Batch {batch_idx}")
+                        if batch_idx == 0:
+                            ax.set_ylabel(f"Ch {channel_idx}")
+
+                        ax.axis('off')
+
+                plt.suptitle("Latent Representation (Channels × Batch)")
+                plt.tight_layout()
+                plt.show()
 
 test_loss_sum /= len(test_dloader)
 print(f"LOSS: {test_loss_sum}")
