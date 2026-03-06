@@ -15,21 +15,17 @@ class MultiHeadLinearAttention(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim)
         self.out_proj = nn.Linear(embed_dim, embed_dim)
 
-        self.norm_q = nn.LayerNorm(embed_dim)
-        self.norm_k = nn.LayerNorm(embed_dim)
-
     def forward(self, query_embed: torch.Tensor, key_embed: torch.Tensor, value: torch.Tensor):
         B, Nq, _ = query_embed.shape
         _, Nk, _ = key_embed.shape
 
         # Project & head-split
-        q = self.norm_q(self.q_proj(query_embed)).view(B, Nq, self.num_heads, self.head_dim)
-        k = self.norm_k(self.k_proj(key_embed)).view(B, Nk, self.num_heads, self.head_dim)
+        q = self.q_proj(query_embed).view(B, Nq, self.num_heads, self.head_dim)
+        k = self.k_proj(key_embed).view(B, Nk, self.num_heads, self.head_dim)
         v = self.v_proj(value).view(B, Nk, self.num_heads, self.head_dim)
 
-        # Positive feature map (ELU+1)
-        q = nn.functional.elu(q) + 1.0
-        k = nn.functional.elu(k) + 1.0
+        q = nn.functional.softmax(q, -1)
+        k = nn.functional.softmax(k, -1)
 
         # Transpose to (B, heads, seq, head_dim) for clean einsums
         q = q.transpose(1, 2)  # (B, H, Nq, D)
@@ -80,7 +76,7 @@ class GRN(nn.Module):
         nx = gx / (gx.mean(dim=-3, keepdim=True) + self.eps)  # relative strength
 
         # 3. Apply + learnable calibration + residual
-        return (1.0 + self.gamma.unsqueeze(-1).unsqueeze(-1)) * (x * nx) + self.beta.unsqueeze(-1).unsqueeze(-1) + x
+        return (self.gamma.unsqueeze(-1).unsqueeze(-1)) * (x * nx) + self.beta.unsqueeze(-1).unsqueeze(-1) + x
 
 
 class PosEmbed2d(nn.Module):
@@ -93,7 +89,11 @@ class PosEmbed2d(nn.Module):
         frequencies = torch.pi * (2.0 ** powers)  # [..., pi/4, pi/2, pi, 2pi, 4pi, ...]
         self.register_buffer("frequencies", frequencies, persistent=True)
 
-        self.norm = ImageNorm(4 * self.num_frequencies)
+        # self.norm = ImageNorm(4 * self.num_frequencies)
+        self.norm = nn.Sequential(
+            GRN(4 * self.num_frequencies),
+            ImageNorm(4 * self.num_frequencies),
+        )
 
     def _make_grid(self, h: int, w: int, relative: bool):
         if relative:
@@ -195,7 +195,10 @@ class ImageAdaLN(nn.Module):
         nn.init.normal_(self.gb[-1].weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.gb[-1].bias)
 
-        self.norm = GRN(out_dim)
+        self.norm = nn.Sequential(
+            GRN(out_dim),
+            ImageNorm(out_dim),
+        )
 
     def forward(self, x, time_cond):
         gb = self.gb(time_cond)
@@ -397,17 +400,18 @@ class R2IRCrossBlock(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
 
-        self.attn_ada = GRN(embed_dim)
+        self.attn_norm = nn.Sequential(
+            GRN(embed_dim),
+            ImageNorm(embed_dim),
+        )
         self.attn = MultiHeadLinearAttention(embed_dim, num_heads, dropout=mha_dropout)
         self.attn_scalar = nn.Parameter(torch.ones(embed_dim))
 
-        self.ffn_norm = GRN(embed_dim)
-        self.ffn = nn.Sequential(
-            nn.Conv2d(embed_dim, embed_dim * 4, 1),
-            nn.SiLU(),
-            nn.Dropout(ffn_dropout),
-            nn.Conv2d(embed_dim * 4, embed_dim, 1)
+        self.ffn_norm = nn.Sequential(
+            GRN(embed_dim),
+            ImageNorm(embed_dim),
         )
+        self.ffn = ImageFFN(embed_dim, ffn_dropout)
         self.ffn_scalar = nn.Parameter(torch.ones(embed_dim))
 
         self.final_scalar = nn.Parameter(torch.ones(embed_dim) * 0.1)
@@ -419,11 +423,11 @@ class R2IRCrossBlock(nn.Module):
 
         working_img = query_img
 
-        # Pre-attn GRN norm
-        attn_adad = self.attn_ada(working_img)
+        # Pre-attn normalization
+        attn_normed = self.attn_norm(working_img)
 
         # Flatten for attn (queries, keys, values)
-        Q_flat = attn_adad.flatten(2).transpose(1, 2)  # [B, Hq*Wq, C]
+        Q_flat = attn_normed.flatten(2).transpose(1, 2)  # [B, Hq*Wq, C]
         K_flat = key_img.flatten(2).transpose(1, 2)  # [B, Hk*Wk, C]
         V_flat = value_img.flatten(2).transpose(1, 2)  # [B, Hk*Wk, C]
 
@@ -436,7 +440,7 @@ class R2IRCrossBlock(nn.Module):
         # Residual + scalar
         working_img = working_img + attn_out * self.attn_scalar.view(1, C, 1, 1)
 
-        # Pre-FFN GRN norm
+        # Pre-FFN normalization
         ffn_normed = self.ffn_norm(working_img)
 
         # FFN (stays in image shape)
