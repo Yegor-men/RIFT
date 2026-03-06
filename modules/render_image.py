@@ -1,6 +1,7 @@
 import torch
 import matplotlib.pyplot as plt
 import math
+from pathlib import Path
 
 
 def render_image(tensor: torch.Tensor, title: str = None, name: str = "", save: bool = False):
@@ -32,5 +33,6 @@ def render_image(tensor: torch.Tensor, title: str = None, name: str = "", save: 
 
     plt.tight_layout()
     if save:
+        Path("media").mkdir(parents=True, exist_ok=True)
         plt.savefig(f"media/{name}.png")
     plt.show()
