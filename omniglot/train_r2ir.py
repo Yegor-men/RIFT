@@ -9,17 +9,17 @@ from save_load_model import save_model, load_model
 
 model = R2IR(
     col_channels=1,
-    lat_channels=256,
-    embed_dim=384,
+    lat_channels=64,
+    embed_dim=256,
     pos_high_freq=10,
     pos_low_freq=6,
-    enc_blocks=1,
-    dec_blocks=1,
-    num_heads=6,
+    enc_blocks=4,
+    dec_blocks=4,
+    num_heads=8,
     mha_dropout=0.1,
     ffn_dropout=0.2,
 )
-r2ir_scale = 15
+r2ir_scale = 1
 
 # model = load_model(model, "foobar.safetensors")
 
@@ -54,14 +54,13 @@ def uninvert_image(image):
     return (image / 2.0) + 0.5
 
 
-batch_size = 20
-
 # Add these imports after the existing imports
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
 # Add this after the batch_size definition (around line 57)
-image_size = 105
+image_size = 32
+batch_size = 40
 
 
 class OmniglotDataset(torch.utils.data.Dataset):
@@ -130,9 +129,9 @@ def make_cosine_with_warmup(optimizer, warmup_steps, total_steps, lr_end):
     return LambdaLR(optimizer, lr_lambda, -1)
 
 
-peak_lr = 1e-3
-final_lr = 1e-5
-num_epochs = 10
+peak_lr = 1e-4
+final_lr = 1e-6
+num_epochs = 40
 total_steps = num_epochs * len(train_dloader)
 warmup_steps = len(train_dloader)
 optimizer = torch.optim.AdamW(model.parameters(), lr=peak_lr)
