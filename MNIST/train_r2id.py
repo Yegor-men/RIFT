@@ -200,9 +200,10 @@ for E in range(num_epochs):
             alpha_bar = alpha_bar_cosine(t).to(device)
             noisy_image, eps = corrupt_image(image, alpha_bar)
             noisy_image, eps = noisy_image.to(device), eps.to(device)
-            pos_cond = text_encoder(label).to(device)
-            null_cond = text_encoder(torch.zeros_like(label)).to(device)
-            cond_list = [pos_cond, null_cond]
+
+        pos_cond = text_encoder(label).to(device)
+        null_cond = text_encoder(torch.zeros_like(label)).to(device)
+        cond_list = [pos_cond, null_cond]
 
         predicted_eps_list = r2id(noisy_image, alpha_bar, cond_list)
         eps_pos, eps_null = predicted_eps_list[0], predicted_eps_list[1]
@@ -315,9 +316,9 @@ for E in range(num_epochs):
         null_text_cond = text_encoder(torch.zeros_like(positive_label))
 
         sizes = [
-            (16, 16, "16px"),
+            # (16, 16, "16px"),
             (32, 32, "32px"),
-            (48, 48, "48px"),
+            # (48, 48, "48px"),
             # (32, 32, 2, "1:1@2"),
             # (32, 32, 4, "1:1@4"),
             # (24, 40, "foo"),
@@ -334,7 +335,7 @@ for E in range(num_epochs):
             # (64, 64, 4, "Double@4"),
         ]
 
-        for lat_size in (4, 6, 8):
+        for lat_size in (4, 6, 8, 10):
             lat_h, lat_w = lat_size, lat_size
             grid_noise = torch.randn(100, r2ir.lat_channels, lat_h, lat_w).to(device)
             final_x0_hat, final_x = run_ddim_visualization(
@@ -344,8 +345,8 @@ for E in range(num_epochs):
                 null_text_cond=null_text_cond,
                 alpha_bar_fn=alpha_bar_cosine,
                 num_steps=100,
-                cfg_scale=1.0,
-                eta=1.0,
+                cfg_scale=4.0,
+                eta=2.0,
                 device=torch.device("cuda"),
             )
 
