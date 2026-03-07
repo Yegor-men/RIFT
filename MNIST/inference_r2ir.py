@@ -86,7 +86,7 @@ model = model.to(device)
 model.eval()
 
 test_loss_sum = 0.0
-render_latent = False
+render_latent = True
 for i, (image, label) in tqdm(enumerate(test_dloader), total=len(test_dloader), desc="TEST"):
     with torch.no_grad():
         image = invert_image(image).to(device)
@@ -121,6 +121,43 @@ for i, (image, label) in tqdm(enumerate(test_dloader), total=len(test_dloader), 
                 plt.suptitle("Latent Representation (Channels × Batch)")
                 plt.tight_layout()
                 plt.show()
+
+from torch import nn
+import numpy as np
+from modules.corrupt_image import corrupt_image
+from modules.alpha_bar import alpha_bar_cosine
+
+with torch.no_grad():
+    t_range = torch.linspace(0, 1, steps=500)
+    t_scrape_losses = []
+
+    for t in t_range:
+        image, label = next(iter(test_dloader))
+        b, c, h, w = image.shape
+        image = invert_image(image).to(device)
+
+        lat_img = model.encode(image, scale=1)
+
+        alpha_bar = alpha_bar_cosine(torch.ones(b) * t).to(device)
+        noisy_latent, _ = corrupt_image(lat_img, alpha_bar)
+
+        recon_img = model.decode(noisy_latent, scale=1)
+
+        loss = nn.functional.mse_loss(recon_img, image)
+        t_scrape_losses.append(loss.item())
+
+    x = np.linspace(0, 1, len(t_scrape_losses))
+    plt.plot(x, t_scrape_losses, label="foo")
+    percentiles = [1, 25, 50, 75, 99]
+    indices = [int(p / 100 * (len(t_scrape_losses) - 1)) for p in percentiles]
+    percentile_x = [x[i] for i in indices]
+    percentile_y = [t_scrape_losses[i] for i in indices]
+    for px, py, p in zip(percentile_x, percentile_y, percentiles):
+        plt.scatter(px, py, color='red')
+        plt.text(px, py, f'{py}', fontsize=9, ha='center', va='bottom')
+    plt.title('T scrape Losses')
+    plt.legend()
+    plt.show()
 
 test_loss_sum /= len(test_dloader)
 print(f"LOSS: {test_loss_sum}")
