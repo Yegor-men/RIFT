@@ -1,4 +1,5 @@
 import torch
+import math
 from torch import nn
 
 
@@ -80,16 +81,15 @@ class GRN(nn.Module):
 
 
 class PosEmbed2d(nn.Module):
-    def __init__(self, num_high_freq: int, num_low_freq: int, eps: float = 1e-6):
+    def __init__(self, num_frequencies: int, eps: float = 1e-6):
         super().__init__()
         self.eps = float(eps)
-        self.num_frequencies = num_high_freq + num_low_freq
+        self.num_frequencies = int(num_frequencies)
 
-        powers = torch.arange(self.num_frequencies, dtype=torch.float32) - num_low_freq  # [0, 1, ...]
+        powers = torch.arange(self.num_frequencies, dtype=torch.float32)  # [0, 1, ...]
         frequencies = torch.pi * (2.0 ** powers)  # [..., pi/4, pi/2, pi, 2pi, 4pi, ...]
         self.register_buffer("frequencies", frequencies, persistent=True)
 
-        # self.norm = ImageNorm(4 * self.num_frequencies)
         self.norm = nn.Sequential(
             GRN(4 * self.num_frequencies),
             ImageNorm(4 * self.num_frequencies),
@@ -461,8 +461,7 @@ class R2IR(nn.Module):
             col_channels: int = 1,
             lat_channels: int = 768,
             embed_dim: int = 1024,
-            pos_high_freq: int = 16,
-            pos_low_freq: int = 16,
+            pos_freq: int = 10,
             enc_blocks: int = 2,
             dec_blocks: int = 2,
             num_heads: int = 16,
@@ -473,12 +472,12 @@ class R2IR(nn.Module):
         self.col_channels = col_channels
         self.lat_channels = lat_channels
         self.embed_dim = embed_dim
-        self.pos_dim = 4 * (pos_high_freq + pos_low_freq)
+        self.pos_dim = 4 * pos_freq
         self.num_enc_blocks = int(enc_blocks)
         self.num_dec_blocks = int(dec_blocks)
         self.num_heads = int(num_heads)
 
-        self.pos_embed = PosEmbed2d(pos_high_freq, pos_low_freq)
+        self.pos_embed = PosEmbed2d(pos_freq)
 
         # col_c + pos -> embed dim
         self.color_to_embed_proj = nn.Conv2d(col_channels + self.pos_dim * 2, embed_dim, 1)
@@ -582,6 +581,165 @@ class R2IR(nn.Module):
 
         out = self.dec_out_proj(out_queries)  # already 4D [B, col_channels, ih, iw]
         return out
+
+
+class HaarWavelet:
+    def __init__(self, levels=3, channels=3):
+        self.levels = levels
+        self.channels = channels
+        self.scale = 1.0 / math.sqrt(2.0)
+
+    def single_level_forward(self, img, run):
+        b, c, h, w = img.shape
+        assert h % 2 == 0 and w % 2 == 0
+
+        # Horizontal
+        even = img[..., ::2]
+        odd = img[..., 1::2]
+        avg_h = (even + odd) * self.scale
+        det_h = (even - odd) * self.scale
+        tmp = torch.cat((avg_h, det_h), dim=-1)  # [b, c, h, w]
+
+        # Vertical
+        even = tmp[..., ::2, :]
+        odd = tmp[..., 1::2, :]
+        avg_v = (even + odd) * self.scale
+        det_v = (even - odd) * self.scale
+        coeffs = torch.cat((avg_v, det_v), dim=-2)  # [b, c, h, w]
+
+        # Normalize details
+        hh = h // 2
+        ww = w // 2
+        coeffs[..., :hh, ww:] /= run  # LH
+        coeffs[..., hh:, :ww] /= run  # HL
+        coeffs[..., hh:, ww:] /= run  # HH
+
+        return coeffs
+
+    def single_level_inverse(self, ll, lh, hl, diag):
+        b, c, hh, ww = ll.shape
+        # Vertical inverse
+        stacked_left = torch.stack((ll, hl), dim=-1)  # [b, c, hh, ww, 2]
+        upper_left = (stacked_left[..., 0] + stacked_left[..., 1]) * self.scale
+        lower_left = (stacked_left[..., 0] - stacked_left[..., 1]) * self.scale
+
+        left_recon = torch.empty((b, c, 2 * hh, ww), dtype=ll.dtype, device=ll.device)
+        left_recon[..., ::2, :] = upper_left
+        left_recon[..., 1::2, :] = lower_left
+
+        stacked_right = torch.stack((lh, diag), dim=-1)
+        upper_right = (stacked_right[..., 0] + stacked_right[..., 1]) * self.scale
+        lower_right = (stacked_right[..., 0] - stacked_right[..., 1]) * self.scale
+
+        right_recon = torch.empty((b, c, 2 * hh, ww), dtype=ll.dtype, device=ll.device)
+        right_recon[..., ::2, :] = upper_right
+        right_recon[..., 1::2, :] = lower_right
+
+        tmp = torch.cat((left_recon, right_recon), dim=-1)  # [b, c, 2*hh, 2*ww]
+
+        # Horizontal inverse
+        h_full, w_full = tmp.shape[-2:]
+        stacked = torch.stack((tmp[..., :w_full // 2], tmp[..., w_full // 2:]), dim=-1)  # [b, c, h_full, w_full//2, 2]
+        even = (stacked[..., 0] + stacked[..., 1]) * self.scale
+        odd = (stacked[..., 0] - stacked[..., 1]) * self.scale
+        recon = torch.empty_like(tmp)
+        recon[..., ::2] = even
+        recon[..., 1::2] = odd
+
+        return recon
+
+    def fold(self, sub, factor, H, W):
+        b, c, sub_h, sub_w = sub.shape
+        assert sub_h == factor * H and sub_w == factor * W
+        tmp = sub.reshape(b, c, factor, H, factor, W)
+        tmp = tmp.permute(0, 1, 2, 4, 3, 5)  # b, c, factor, factor, H, W
+        folded = tmp.reshape(b, c * factor ** 2, H, W)
+        return folded
+
+    def unfold(self, folded, factor, H, W):
+        b, ch, h, w = folded.shape
+        assert ch == self.channels * factor ** 2 and h == H and w == W
+        tmp = folded.reshape(b, self.channels, factor, factor, H, W)
+        tmp = tmp.permute(0, 1, 2, 4, 3, 5)  # b, channels, factor, H, factor, W
+        unfolded = tmp.reshape(b, self.channels, factor * H, factor * W)
+        return unfolded
+
+    def encode(self, img):
+        b, c, h, w = img.shape
+        assert c == self.channels
+        power = 2 ** self.levels
+        assert h % power == 0 and w % power == 0
+
+        subbands = []
+        current = img
+        for _ in range(self.levels):
+            h_curr, w_curr = current.shape[-2:]
+            run = 1.0 / max(h_curr, w_curr)
+            coeffs = self.single_level_forward(current, run)
+            hh = h_curr // 2
+            ww = w_curr // 2
+            subbands.append((
+                coeffs[..., :hh, ww:],
+                coeffs[..., hh:, :ww],
+                coeffs[..., hh:, ww:]
+            ))
+            current = coeffs[..., :hh, :ww]
+
+        H, W = current.shape[-2:]
+        latent_parts = [current]
+        lev = 0
+        for det in reversed(subbands):
+            lh, hl, hh_d = det
+            f = 2 ** lev
+            lh_f = self.fold(lh, f, H, W)
+            hl_f = self.fold(hl, f, H, W)
+            hh_f = self.fold(hh_d, f, H, W)
+            latent_parts += [lh_f, hl_f, hh_f]
+            lev += 1
+
+        latent = torch.cat(latent_parts, dim=1)
+        params = {'original_shape': (b, c, h, w)}
+        return latent, params
+
+    def decode(self, latent, params):
+        original_shape = params['original_shape']
+        b, c, h, w = original_shape
+        b_, C, H, W = latent.shape
+        power = 2 ** self.levels
+        assert b_ == b and C == self.channels * (4 ** self.levels) and h == H * power and w == W * power
+
+        idx = 0
+        current = latent[:, idx: idx + self.channels, :, :]
+        idx += self.channels
+
+        details_list = []
+        for lev in range(self.levels):
+            fold_ch = self.channels * (4 ** lev)
+            lh_f = latent[:, idx: idx + fold_ch, :, :]
+            idx += fold_ch
+            hl_f = latent[:, idx: idx + fold_ch, :, :]
+            idx += fold_ch
+            hh_f = latent[:, idx: idx + fold_ch, :, :]
+            idx += fold_ch
+            details_list.append((lh_f, hl_f, hh_f))
+
+        for lev in range(self.levels):
+            lh_f, hl_f, hh_f = details_list[lev]
+            f = 2 ** lev
+            lh = self.unfold(lh_f, f, H, W)
+            hl = self.unfold(hl_f, f, H, W)
+            diag = self.unfold(hh_f, f, H, W)
+
+            curr_h, curr_w = current.shape[-2:]
+            local_run = 1.0 / max(curr_h, curr_w)
+            run_encode = local_run / 2
+            lh_scaled = lh * run_encode
+            hl_scaled = hl * run_encode
+            diag_scaled = diag * run_encode
+
+            current = self.single_level_inverse(current, lh_scaled, hl_scaled, diag_scaled)
+
+        return current
 
 
 # ======================================================================================================================
