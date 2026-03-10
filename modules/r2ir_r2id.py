@@ -158,7 +158,7 @@ class PosEmbed2d(nn.Module):
 
 
 class ContTimeEmbed(nn.Module):
-    def __init__(self, num_high_freq: int, num_low_freq: int, eps: float = 1e-6):
+    def __init__(self, num_high_freq: int, num_low_freq: int = 0, eps: float = 1e-6):
         super().__init__()
         self.eps = float(eps)
         self.num_frequencies = num_high_freq + num_low_freq
@@ -698,15 +698,13 @@ class HaarWavelet:
             lev += 1
 
         latent = torch.cat(latent_parts, dim=1)
-        params = {'original_shape': (b, c, h, w)}
-        return latent, params
+        return latent
 
-    def decode(self, latent, params):
-        original_shape = params['original_shape']
-        b, c, h, w = original_shape
+    def decode(self, latent):
         b_, C, H, W = latent.shape
         power = 2 ** self.levels
-        assert b_ == b and C == self.channels * (4 ** self.levels) and h == H * power and w == W * power
+        assert C == self.channels * (4 ** self.levels)
+        b, c, h, w = b_, self.channels, H * power, W * power
 
         idx = 0
         current = latent[:, idx: idx + self.channels, :, :]
@@ -752,10 +750,12 @@ class R2ID(nn.Module):
             enc_blocks: int,  # number of encoder blocks (no cross attention)
             dec_blocks: int,  # number of decoder blocks (yes cross attention)
             num_heads: int,  # num heads in each block, d_channels must be divisible here
-            pos_high_freq: int,
-            pos_low_freq: int,
+            # pos_high_freq: int,
+            # pos_low_freq: int,
             time_high_freq: int,
             time_low_freq: int,
+            pos_freq: int,
+            # time_freq: int,
             film_dim: int,  # dimension that the base film vector sits in, then gets turned to d channels
             self_attn_dropout: float = 0.0,
             cross_attn_dropout: float = 0.0,
@@ -767,8 +767,10 @@ class R2ID(nn.Module):
         self.num_enc_blocks = int(enc_blocks)
         self.num_dec_blocks = int(dec_blocks)
         self.num_heads = int(num_heads)
-        self.num_pos_frequencies = int(pos_low_freq + pos_high_freq)
+        # self.num_pos_frequencies = int(pos_low_freq + pos_high_freq)
         self.num_time_frequencies = int(time_low_freq + time_high_freq)
+        self.num_pos_frequencies = int(pos_freq)
+        # self.num_time_frequencies = int(time_freq)
         self.film_dim = int(film_dim)
 
         self.proj_to_latent = nn.Conv2d(self.num_pos_frequencies * 4 * 2 + c_channels, d_channels, 1)
@@ -776,7 +778,9 @@ class R2ID(nn.Module):
         nn.init.zeros_(self.latent_to_epsilon.weight)
         nn.init.zeros_(self.latent_to_epsilon.bias)
 
-        self.pos_embed = PosEmbed2d(pos_high_freq, pos_low_freq)
+        # self.pos_embed = PosEmbed2d(pos_high_freq, pos_low_freq)
+        # self.time_embed = ContTimeEmbed(time_high_freq, time_low_freq)
+        self.pos_embed = PosEmbed2d(pos_freq)
         self.time_embed = ContTimeEmbed(time_high_freq, time_low_freq)
         self.film_proj = nn.Sequential(
             nn.Linear(self.num_time_frequencies * 2, film_dim),
