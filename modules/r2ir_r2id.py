@@ -589,7 +589,7 @@ class HaarWavelet:
         self.channels = channels
         self.scale = 1.0 / math.sqrt(2.0)
 
-    def single_level_forward(self, img, run):
+    def single_level_forward(self, img):
         b, c, h, w = img.shape
         assert h % 2 == 0 and w % 2 == 0
 
@@ -606,13 +606,6 @@ class HaarWavelet:
         avg_v = (even + odd) * self.scale
         det_v = (even - odd) * self.scale
         coeffs = torch.cat((avg_v, det_v), dim=-2)  # [b, c, h, w]
-
-        # Normalize details
-        hh = h // 2
-        ww = w // 2
-        coeffs[..., :hh, ww:] /= run  # LH
-        coeffs[..., hh:, :ww] /= run  # HL
-        coeffs[..., hh:, ww:] /= run  # HH
 
         return coeffs
 
@@ -673,11 +666,9 @@ class HaarWavelet:
         subbands = []
         current = img
         for _ in range(self.levels):
-            h_curr, w_curr = current.shape[-2:]
-            run = 1.0 / max(h_curr, w_curr)
-            coeffs = self.single_level_forward(current, run)
-            hh = h_curr // 2
-            ww = w_curr // 2
+            coeffs = self.single_level_forward(current)
+            hh = current.shape[-2] // 2
+            ww = current.shape[-1] // 2
             subbands.append((
                 coeffs[..., :hh, ww:],
                 coeffs[..., hh:, :ww],
@@ -728,14 +719,7 @@ class HaarWavelet:
             hl = self.unfold(hl_f, f, H, W)
             diag = self.unfold(hh_f, f, H, W)
 
-            curr_h, curr_w = current.shape[-2:]
-            local_run = 1.0 / max(curr_h, curr_w)
-            run_encode = local_run / 2
-            lh_scaled = lh * run_encode
-            hl_scaled = hl * run_encode
-            diag_scaled = diag * run_encode
-
-            current = self.single_level_inverse(current, lh_scaled, hl_scaled, diag_scaled)
+            current = self.single_level_inverse(current, lh, hl, diag)
 
         return current
 
