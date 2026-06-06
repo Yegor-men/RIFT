@@ -40,23 +40,26 @@ FIGURE_DIR = Path("MNIST/media/tests")
 CFG_SCALE = 1.0
 SAMPLE_STEPS = 16
 TRAJECTORY_STEP_COUNT = 10  # Number of timestep rows to show; snapshots are sub-sampled from SAMPLE_STEPS.
+CLEAN_START_STEPS = 15
+CLEAN_START_INTEGRATION_SPAN = 1.0
+CLEAN_START_NOISE_MIX = 0.9
 
 SQUARE_SIZES = (20, 28, 48)
 # ASPECT_EDGE_LENGTHS = (28, 32, 36, 40)
 ASPECT_EDGE_LENGTHS = (28, 32)
-WRONG_T_VALUES = (None, 0.1, 0.5, 0.9)  # None means normal true-t sampling.
 
-T_SCRAPE_POINTS = 200
+T_SCRAPE_POINTS = 50
 T_SCRAPE_BATCH_SIZE = 64
 T_SCRAPE_MAX_BATCHES = 8
 T_SCRAPE_IMAGE_SIZE = 28
+CORRUPTION_LOSS_WEIGHT = 1.0
 
 RUN_SQUARE_TRAJECTORIES = True
 RUN_ASPECT_RATIO_GRID = True
-RUN_WRONG_T_TRAJECTORIES = True
 RUN_T_SCRAPE_LOSS = True
 RUN_CLEAN_START_TRAJECTORY = True
 CLEAN_START_SHOW_VELOCITY = False
+CLEAN_START_SHOW_CORRUPTION = True
 
 
 # DATA =================================================================================================================
@@ -170,15 +173,26 @@ def clean_digit_batch(image_size: int, device: torch.device) -> tuple[torch.Tens
 
 
 @torch.no_grad()
-def predict_velocity(model, conditioner, x, labels, t_for_model, cfg_scale: float):
+def predict_outputs(model, conditioner, x, labels, t_for_model, cfg_scale: float):
     pos_tokens = conditioner(labels)
     if cfg_scale == 1.0:
-        return model(x, t_for_model, [pos_tokens])[0]
+        velocity, corruption = model(x, t_for_model, [pos_tokens])[0]
+        return velocity, corruption
 
     null_labels = torch.full_like(labels, conditioner.null_label)
     null_tokens = conditioner(null_labels)
-    v_null, v_pos = model(x, t_for_model, [null_tokens, pos_tokens])
-    return v_null + cfg_scale * (v_pos - v_null)
+    (v_null, _), (v_pos, corruption_pos) = model(x, t_for_model, [null_tokens, pos_tokens])
+    return v_null + cfg_scale * (v_pos - v_null), corruption_pos
+
+
+def corruption_target(clean_image: torch.Tensor, model_input: torch.Tensor) -> torch.Tensor:
+    return (clean_image - model_input).mean(dim=1, keepdim=True)
+
+
+def r2id_eval_loss(predicted_velocity, target_velocity, predicted_corruption, target_corruption):
+    velocity_loss = nn.functional.mse_loss(predicted_velocity, target_velocity)
+    corruption_loss = nn.functional.mse_loss(predicted_corruption, target_corruption)
+    return velocity_loss + CORRUPTION_LOSS_WEIGHT * corruption_loss
 
 
 @torch.no_grad()
@@ -193,6 +207,7 @@ def sample_with_trace(
         forced_t: float | None = None,
         cfg_scale: float = 1.0,
         initial_x: torch.Tensor | None = None,
+        integration_span: float = 1.0,
 ):
     if initial_x is None:
         x = sample_noise((labels.shape[0], 1, height, width), device=device)
@@ -200,9 +215,10 @@ def sample_with_trace(
         x = initial_x.to(device=device).clamp(0.0, 1.0)
         if x.shape != (labels.shape[0], 1, height, width):
             raise ValueError(f"initial_x shape {tuple(x.shape)} does not match labels/size {(labels.shape[0], 1, height, width)}")
-    times = torch.linspace(0.0, 1.0, steps=steps + 1, device=device)
+    times = torch.linspace(0.0, float(integration_span), steps=steps + 1, device=device)
     image_trace = [x.detach().cpu()]
     velocity_trace = []
+    corruption_trace = []
     used_t_values = []
 
     for step in range(steps):
@@ -213,13 +229,14 @@ def sample_with_trace(
         else:
             t_for_model = torch.full_like(t_current, float(forced_t))
 
-        v = predict_velocity(model, conditioner, x.clamp(0.0, 1.0), labels, t_for_model, cfg_scale)
+        v, corruption = predict_outputs(model, conditioner, x.clamp(0.0, 1.0), labels, t_for_model, cfg_scale)
         velocity_trace.append(v.detach().cpu())
+        corruption_trace.append(corruption.detach().cpu())
         used_t_values.append(float(t_for_model[0].item()))
         x, _ = velocity_step(x, t_current, t_next, v)
         image_trace.append(x.detach().cpu())
 
-    return image_trace, velocity_trace, used_t_values
+    return image_trace, velocity_trace, corruption_trace, used_t_values
 
 
 # PLOTTING =============================================================================================================
@@ -270,6 +287,7 @@ def show_trace_grid(
         labels: torch.Tensor,
         value_range: tuple[float, float] = (0.0, 1.0),
         map_velocity: bool = False,
+        map_corruption: bool = False,
         column_titles: list[str] | None = None,
 ) -> None:
     row_indices = pick_trace_indices(len(trace), TRAJECTORY_STEP_COUNT)
@@ -284,12 +302,22 @@ def show_trace_grid(
         if map_velocity:
             images = (images * 0.5 + 0.5).clamp(0.0, 1.0)
             vmin, vmax = 0.0, 1.0
+        elif map_corruption:
+            signed_images = images.clamp(-1.0, 1.0)
+            red = signed_images.clamp(min=0.0)
+            blue = (-signed_images).clamp(min=0.0)
+            green = torch.zeros_like(red)
+            images = torch.cat([red, green, blue], dim=1).clamp(0.0, 1.0)
         else:
             images = images.clamp(vmin, vmax)
         for col in range(cols):
             ax = axes[row][col]
             ax.axis("off")
-            ax.imshow(images[col].squeeze(0), cmap="gray", vmin=vmin, vmax=vmax)
+            image = images[col]
+            if image.shape[0] == 1:
+                ax.imshow(image.squeeze(0), cmap="gray", vmin=vmin, vmax=vmax)
+            else:
+                ax.imshow(image.permute(1, 2, 0))
             if row == 0:
                 text = column_titles[col] if column_titles else str(int(labels[col].item()))
                 ax.set_title(text, fontsize=8)
@@ -303,10 +331,10 @@ def show_trace_grid(
 
 def show_t_loss_curve(t_values: torch.Tensor, losses: list[float]) -> None:
     plt.figure(figsize=(10, 4))
-    plt.title("MNIST R2ID velocity MSE across fixed t values")
+    plt.title("MNIST R2ID loss across fixed corruption mixes")
     plt.plot(t_values.cpu().tolist(), losses)
-    plt.xlabel("t given to model / corruption mix")
-    plt.ylabel("MSE(predicted velocity, clean - noise)")
+    plt.xlabel("t used to construct x_t")
+    plt.ylabel("velocity MSE + corruption-map MSE")
     plt.grid(True, alpha=0.25)
     plt.tight_layout()
     maybe_savefig("t_scrape_loss_curve")
@@ -318,7 +346,7 @@ def show_t_loss_curve(t_values: torch.Tensor, losses: list[float]) -> None:
 def run_square_resolution_trajectories(model, conditioner, device):
     labels = digit_labels(1, device)
     for size in SQUARE_SIZES:
-        image_trace, velocity_trace, _ = sample_with_trace(
+        image_trace, velocity_trace, corruption_trace, _ = sample_with_trace(
             model=model,
             conditioner=conditioner,
             labels=labels,
@@ -342,6 +370,13 @@ def run_square_resolution_trajectories(model, conditioner, device):
             labels=labels.cpu(),
             map_velocity=True,
         )
+        show_trace_grid(
+            corruption_trace,
+            title=f"1:1 signed corruption magnitude | {size}x{size}",
+            name=f"square_{size}_corruption_trace",
+            labels=labels.cpu(),
+            map_corruption=True,
+        )
 
 
 # EXPERIMENT 2: ASPECT RATIO GENERALIZATION ============================================================================
@@ -350,7 +385,7 @@ def run_aspect_ratio_grid(model, conditioner, device):
     labels = digit_labels(10, device)
     for height in ASPECT_EDGE_LENGTHS:
         for width in ASPECT_EDGE_LENGTHS:
-            image_trace, _, _ = sample_with_trace(
+            image_trace, _, _, _ = sample_with_trace(
                 model=model,
                 conditioner=conditioner,
                 labels=labels,
@@ -368,41 +403,7 @@ def run_aspect_ratio_grid(model, conditioner, device):
             )
 
 
-# EXPERIMENT 3: WRONG-T SAMPLING =======================================================================================
-
-def run_wrong_t_trajectories(model, conditioner, device):
-    labels = digit_labels(1, device)
-    for forced_t in WRONG_T_VALUES:
-        image_trace, velocity_trace, used_t_values = sample_with_trace(
-            model=model,
-            conditioner=conditioner,
-            labels=labels,
-            height=28,
-            width=28,
-            steps=SAMPLE_STEPS,
-            device=device,
-            forced_t=forced_t,
-            cfg_scale=CFG_SCALE,
-        )
-        name = "true_t" if forced_t is None else f"forced_t_{forced_t:.2f}"
-        title_t = "true t" if forced_t is None else f"forced t={forced_t:.2f}"
-        show_trace_grid(
-            image_trace,
-            title=f"28x28 diffusion trajectory | {title_t}",
-            name=f"wrong_t_{name}_image_trace",
-            labels=labels.cpu(),
-        )
-        show_trace_grid(
-            velocity_trace,
-            title=f"28x28 model velocity outputs | {title_t}",
-            name=f"wrong_t_{name}_velocity_trace",
-            labels=labels.cpu(),
-            map_velocity=True,
-        )
-        print(f"Wrong-t run {name}: used model t values {used_t_values[:5]} ... {used_t_values[-5:]}")
-
-
-# EXPERIMENT 4: T-SCRAPE LOSS CURVE ====================================================================================
+# EXPERIMENT 3: T-SCRAPE LOSS CURVE ====================================================================================
 
 @torch.no_grad()
 def run_t_scrape_loss(model, conditioner, device):
@@ -423,8 +424,9 @@ def run_t_scrape_loss(model, conditioner, device):
             labels = labels.to(device, dtype=torch.long)
             t_batch = torch.full((images.shape[0],), float(t_value.item()), device=device)
             model_input, target_velocity, _ = velocity_training_pair(images, t_batch)
-            predicted_velocity = model(model_input, t_batch, [conditioner(labels)])[0]
-            total_loss += nn.functional.mse_loss(predicted_velocity, target_velocity).item()
+            target_corruption = corruption_target(images, model_input)
+            predicted_velocity, predicted_corruption = model(model_input, t_batch, [conditioner(labels)])[0]
+            total_loss += r2id_eval_loss(predicted_velocity, target_velocity, predicted_corruption, target_corruption).item()
             batches += 1
         losses.append(total_loss / max(1, batches))
 
@@ -435,28 +437,38 @@ def run_t_scrape_loss(model, conditioner, device):
     print(f"Worst t={float(t_values[worst_idx].item()):.4f} loss={losses[worst_idx]:.6f}")
 
 
-# EXPERIMENT 5: CLEAN-IMAGE START ======================================================================================
+# EXPERIMENT 4: CLEAN-IMAGE START ======================================================================================
 
 def run_clean_start_trajectory(model, conditioner, device):
     clean_images, source_labels = clean_digit_batch(image_size=28, device=device)
+    clean_start_noise = sample_noise(clean_images.shape, device=device)
+    mixed_start_images = (
+        (1.0 - CLEAN_START_NOISE_MIX) * clean_images + CLEAN_START_NOISE_MIX * clean_start_noise
+    ).clamp(0.0, 1.0)
+
     for shift in range(10):
         target_labels = (source_labels + shift) % 10
-        image_trace, velocity_trace, _ = sample_with_trace(
+        image_trace, velocity_trace, corruption_trace, _ = sample_with_trace(
             model=model,
             conditioner=conditioner,
             labels=target_labels,
             height=28,
             width=28,
-            steps=SAMPLE_STEPS,
+            steps=CLEAN_START_STEPS,
             device=device,
             forced_t=None,
             cfg_scale=CFG_SCALE,
-            initial_x=clean_images,
+            initial_x=mixed_start_images,
+            integration_span=CLEAN_START_INTEGRATION_SPAN,
         )
         column_titles = source_to_target_titles(source_labels, target_labels)
         show_trace_grid(
             image_trace,
-            title=f"28x28 clean-start overwrite trajectory | target = source + {shift} mod 10",
+            title=(
+                f"28x28 clean-start overwrite trajectory | target = source + {shift} mod 10 | "
+                f"steps={CLEAN_START_STEPS}, span={CLEAN_START_INTEGRATION_SPAN:g}, "
+                f"noise_mix={CLEAN_START_NOISE_MIX:g}"
+            ),
             name=f"clean_start_shift_{shift}_image_trace",
             labels=target_labels.cpu(),
             column_titles=column_titles,
@@ -468,6 +480,15 @@ def run_clean_start_trajectory(model, conditioner, device):
                 name=f"clean_start_shift_{shift}_velocity_trace",
                 labels=target_labels.cpu(),
                 map_velocity=True,
+                column_titles=column_titles,
+            )
+        if CLEAN_START_SHOW_CORRUPTION:
+            show_trace_grid(
+                corruption_trace,
+                title=f"28x28 clean-start overwrite corruption | target = source + {shift} mod 10",
+                name=f"clean_start_shift_{shift}_corruption_trace",
+                labels=target_labels.cpu(),
+                map_corruption=True,
                 column_titles=column_titles,
             )
 
@@ -483,8 +504,6 @@ def main() -> None:
         run_square_resolution_trajectories(model, conditioner, device)
     if RUN_ASPECT_RATIO_GRID:
         run_aspect_ratio_grid(model, conditioner, device)
-    if RUN_WRONG_T_TRAJECTORIES:
-        run_wrong_t_trajectories(model, conditioner, device)
     if RUN_T_SCRAPE_LOSS:
         run_t_scrape_loss(model, conditioner, device)
     if RUN_CLEAN_START_TRAJECTORY:

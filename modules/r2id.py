@@ -197,14 +197,44 @@ class ContTimeEmbed(nn.Module):
         self.norm = nn.LayerNorm(2 * self.num_frequencies, elementwise_affine=False)
 
     def forward(self, time: torch.Tensor) -> torch.Tensor:
-        tproj = time.unsqueeze(1) * self.frequencies.view(1, -1)
-        sin_feat = torch.sin(tproj)
-        cos_feat = torch.cos(tproj)
-        feat = torch.cat([sin_feat, cos_feat], dim=-1)
+        if time.ndim == 1:
+            tproj = time.unsqueeze(1) * self.frequencies.view(1, -1)
+            sin_feat = torch.sin(tproj)
+            cos_feat = torch.cos(tproj)
+            feat = torch.cat([sin_feat, cos_feat], dim=-1)
+            return self.norm(feat)
 
-        time_vector = self.norm(feat)
+        if time.ndim == 4:
+            assert time.shape[1] == 1, "Per-pixel time maps must have shape [B, 1, H, W]"
+            tproj = time * self.frequencies.view(1, -1, 1, 1)
+            sin_feat = torch.sin(tproj)
+            cos_feat = torch.cos(tproj)
+            feat = torch.cat([sin_feat, cos_feat], dim=1)
+            feat = torch.movedim(feat, 1, -1)
+            feat = self.norm(feat)
+            return torch.movedim(feat, -1, 1)
 
-        return time_vector
+        raise ValueError(f"Expected time tensor with shape [B] or [B, 1, H, W], got {tuple(time.shape)}")
+
+
+class TimeConditionProjector(nn.Module):
+    def __init__(self, input_dim: int, film_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, film_dim),
+            nn.SiLU(),
+            nn.Linear(film_dim, film_dim),
+            nn.SiLU(),
+        )
+
+    def forward(self, time_features: torch.Tensor) -> torch.Tensor:
+        if time_features.ndim == 2:
+            return self.net(time_features)
+        if time_features.ndim == 4:
+            time_features = torch.movedim(time_features, 1, -1)
+            time_features = self.net(time_features)
+            return torch.movedim(time_features, -1, 1)
+        raise ValueError(f"Expected time features with shape [B, F] or [B, F, H, W], got {tuple(time_features.shape)}")
 
 
 class ImageAdaLN(nn.Module):
@@ -224,13 +254,23 @@ class ImageAdaLN(nn.Module):
         )
 
     def forward(self, x, time_cond):
-        gb = self.gb(time_cond)
-        gamma, beta = gb.chunk(2, dim=-1)
-        gamma = 1.0 + gamma
+        if time_cond.ndim == 2:
+            gb = self.gb(time_cond)
+            gamma, beta = gb.chunk(2, dim=-1)
+            gamma = 1.0 + gamma
+            x = self.norm(x) * gamma.unsqueeze(-1).unsqueeze(-1) + beta.unsqueeze(-1).unsqueeze(-1)
+            return x
 
-        x = self.norm(x) * gamma.unsqueeze(-1).unsqueeze(-1) + beta.unsqueeze(-1).unsqueeze(-1)
+        if time_cond.ndim == 4:
+            gb = self.gb(torch.movedim(time_cond, 1, -1))
+            gamma, beta = gb.chunk(2, dim=-1)
+            gamma = 1.0 + gamma
+            gamma = torch.movedim(gamma, -1, 1)
+            beta = torch.movedim(beta, -1, 1)
+            x = self.norm(x) * gamma + beta
+            return x
 
-        return x
+        raise ValueError(f"Expected conditioning with shape [B, D] or [B, D, H, W], got {tuple(time_cond.shape)}")
 
 
 class ImageFFN(nn.Module):
@@ -342,8 +382,8 @@ class EncBlock(nn.Module):
             self,
             d_channels: int,
             num_heads: int,
-            film_dim: int,
             self_attn_dropout: float = 0.0,
+            cross_attn_dropout: float = 0.0,
             ffn_dropout: float = 0.0,
             linear_attention: bool = False,
     ):
@@ -351,7 +391,23 @@ class EncBlock(nn.Module):
         self.d_channels = d_channels
 
         self_attn_cls = LinearSelfAttention if linear_attention else SelfAttention
-        self.self_ada = ImageAdaLN(film_dim, d_channels)
+        cross_attn_cls = LinearCrossAttention if linear_attention else CrossAttention
+
+        self.cross_norm = nn.Sequential(
+            GRN(d_channels),
+            ImageNorm(d_channels),
+        )
+        self.cross_attn = cross_attn_cls(
+            d_channels=d_channels,
+            num_heads=num_heads,
+            dropout=cross_attn_dropout,
+        )
+        self.cross_scalar = nn.Parameter(torch.ones(d_channels))
+
+        self.self_norm = nn.Sequential(
+            GRN(d_channels),
+            ImageNorm(d_channels),
+        )
         self.self_attn = self_attn_cls(
             d_channels=d_channels,
             num_heads=num_heads,
@@ -359,22 +415,30 @@ class EncBlock(nn.Module):
         )
         self.self_scalar = nn.Parameter(torch.ones(d_channels))
 
-        self.ffn_ada = ImageAdaLN(film_dim, d_channels)
+        self.ffn_norm = nn.Sequential(
+            GRN(d_channels),
+            ImageNorm(d_channels),
+        )
         self.ffn = ImageFFN(d_channels, ffn_dropout)
         self.ffn_scalar = nn.Parameter(torch.ones(d_channels))
 
         self.final_scalar = nn.Parameter(torch.ones(d_channels) * 0.1)
 
-    def forward(self, image, film_vector):
+    def forward(self, image, text_tokens):
         working_image = image
 
-        self_adad = self.self_ada(working_image, film_vector)
-        self_out = self.self_attn(self_adad)
+        cross_normed = self.cross_norm(working_image)
+        cross_out = self.cross_attn(cross_normed, text_tokens)
+
+        working_image = working_image + cross_out * self.cross_scalar.view(1, self.d_channels, 1, 1)
+
+        self_normed = self.self_norm(working_image)
+        self_out = self.self_attn(self_normed)
 
         working_image = working_image + self_out * self.self_scalar.view(1, self.d_channels, 1, 1)
 
-        ffn_adad = self.ffn_ada(working_image, film_vector)
-        ffn_out = self.ffn(ffn_adad)
+        ffn_normed = self.ffn_norm(working_image)
+        ffn_out = self.ffn(ffn_normed)
 
         working_image = working_image + ffn_out * self.ffn_scalar.view(1, self.d_channels, 1, 1)
 
@@ -539,24 +603,22 @@ class R2ID(nn.Module):
 
         self.proj_to_latent = nn.Conv2d(input_channels, d_channels, 1)
         self.latent_to_velocity = nn.Conv2d(d_channels, c_channels, 1)
+        self.latent_to_corruption = nn.Conv2d(d_channels, 1, 1)
         nn.init.zeros_(self.latent_to_velocity.weight)
         nn.init.zeros_(self.latent_to_velocity.bias)
+        nn.init.zeros_(self.latent_to_corruption.weight)
+        nn.init.zeros_(self.latent_to_corruption.bias)
 
         self.pos_embed = PosEmbed2d(pos_freq)
         self.time_embed = ContTimeEmbed(time_freq)
-        self.film_proj = nn.Sequential(
-            nn.Linear(self.num_time_frequencies * 2, film_dim),
-            nn.SiLU(),
-            nn.Linear(film_dim, film_dim),
-            nn.SiLU()
-        )
+        self.film_proj = TimeConditionProjector(self.num_time_frequencies * 2, film_dim)
 
         self.enc_blocks = nn.ModuleList([
             EncBlock(
                 d_channels=d_channels,
                 num_heads=num_heads,
-                film_dim=film_dim,
                 self_attn_dropout=self_attn_dropout,
+                cross_attn_dropout=cross_attn_dropout,
                 ffn_dropout=ffn_dropout,
                 linear_attention=linear_attention,
             ) for _ in range(self.block_count)
@@ -588,6 +650,9 @@ class R2ID(nn.Module):
         print(f"Block count: {self.block_count}")
         print(f"Channels for color/positioning: {total_col_channels}/{total_pos_channels}, total: {total_channels}")
         print(f"Attention: {'linear gated' if self.linear_attention else 'full'}")
+        print("Encoder time conditioning: disabled")
+        print("Encoder text conditioning: enabled")
+        print("Decoder time conditioning: signed predicted per-pixel corruption map")
         if self.skip_fusion:
             print(
                 f"Decoder skip attention: enabled, encoder_input_stack={self.num_enc_blocks}, "
@@ -601,35 +666,37 @@ class R2ID(nn.Module):
         assert image.ndim == 4, "Image must be batch, tensor shape of [B, C, H, W]"
         b, c, h, w = image.shape
 
-        velocity_list = []
-
-        time_vector = self.time_embed(time)  # [B, time_dim]
-        film_vector = self.film_proj(time_vector)
+        output_list = []
 
         pos_map = self.pos_embed(b, h, w)
 
         stacked_latent = torch.cat([image, pos_map], dim=-3)
-        latent = self.proj_to_latent(stacked_latent)
-
-        encoder_inputs = []
-        for enc_block in self.enc_blocks:
-            if self.skip_fusion:
-                encoder_inputs.append(latent)
-            latent = enc_block(latent, film_vector)
-
-        if self.skip_fusion:
-            skip_sources = list(reversed(encoder_inputs))
-        else:
-            skip_sources = [None for _ in self.dec_blocks]
+        initial_latent = self.proj_to_latent(stacked_latent)
 
         for token_sequence in text_conds:
+            latent = initial_latent
+            encoder_inputs = []
+            for enc_block in self.enc_blocks:
+                if self.skip_fusion:
+                    encoder_inputs.append(latent)
+                latent = enc_block(latent, token_sequence)
+
+            corruption_map = torch.tanh(self.latent_to_corruption(latent))
+            time_map = self.time_embed(corruption_map)
+            film_map = self.film_proj(time_map)
+
+            if self.skip_fusion:
+                skip_sources = list(reversed(encoder_inputs))
+            else:
+                skip_sources = [None for _ in self.dec_blocks]
+
             lat = latent
             for i, dec_block in enumerate(self.dec_blocks):
-                lat = dec_block(lat, film_vector, token_sequence, skip_sources[i])
+                lat = dec_block(lat, film_map, token_sequence, skip_sources[i])
             velocity = torch.tanh(self.latent_to_velocity(lat)) * self.velocity_output_scale
-            velocity_list.append(velocity)
+            output_list.append((velocity, corruption_map))
 
-        return velocity_list
+        return output_list
 
 
 class R2IDLinear(R2ID):

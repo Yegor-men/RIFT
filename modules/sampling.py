@@ -36,10 +36,10 @@ def run_velocity_sampling(
         model_input = x.clamp(0.0, 1.0)
 
         if use_cfg:
-            v_null, v_pos = model(model_input, t_batch, [null_text_cond, pos_text_cond])
+            (v_null, _), (v_pos, _) = model(model_input, t_batch, [null_text_cond, pos_text_cond])
             v_hat = guided_velocity(v_null, v_pos, cfg_scale)
         else:
-            v_hat = model(model_input, t_batch, [pos_text_cond])[0]
+            v_hat, _ = model(model_input, t_batch, [pos_text_cond])[0]
 
         x, x1_hat = velocity_step(x, t_batch, s_batch, v_hat)
 

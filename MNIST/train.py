@@ -57,6 +57,7 @@ LR = 1e-3
 LR_END = 1e-6
 EMA_DECAY = 0.999
 CFG_DROPOUT = 0.1
+CORRUPTION_LOSS_WEIGHT = 1.0
 
 TEST_SIZES = (14, 28, 64)
 T_LOSS_VALUES = (0.01, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99)
@@ -190,13 +191,24 @@ def build_conditioner(device: torch.device) -> ClassLabelConditioner:
     return ClassLabelConditioner(NUM_CLASSES, TOKEN_COUNT, D_CHANNELS).to(device)
 
 
+def corruption_target(clean_image: torch.Tensor, model_input: torch.Tensor) -> torch.Tensor:
+    return (clean_image - model_input).mean(dim=1, keepdim=True)
+
+
+def r2id_training_loss(predicted_velocity, target_velocity, predicted_corruption, target_corruption):
+    velocity_loss = nn.functional.mse_loss(predicted_velocity, target_velocity)
+    corruption_loss = nn.functional.mse_loss(predicted_corruption, target_corruption)
+    return velocity_loss + CORRUPTION_LOSS_WEIGHT * corruption_loss
+
+
 def velocity_prediction_loss(model: R2ID, conditioner: ClassLabelConditioner, image: torch.Tensor, labels: torch.Tensor):
     image = image.clamp(0.0, 1.0)
     time_t = torch.rand(image.shape[0], device=image.device)
     model_input, target_velocity, _ = velocity_training_pair(image, time_t)
+    target_corruption = corruption_target(image, model_input)
     train_labels = make_training_labels(labels, conditioner.null_label)
-    predicted_velocity = model(model_input, time_t, [conditioner(train_labels)])[0]
-    return nn.functional.mse_loss(predicted_velocity, target_velocity)
+    predicted_velocity, predicted_corruption = model(model_input, time_t, [conditioner(train_labels)])[0]
+    return r2id_training_loss(predicted_velocity, target_velocity, predicted_corruption, target_corruption)
 
 
 # EVAL / SAMPLING ======================================================================================================
@@ -220,8 +232,9 @@ def evaluate(model: R2ID, conditioner: ClassLabelConditioner, dataloader: DataLo
 
             time_t = torch.rand(image.shape[0], device=device)
             model_input, target_velocity, _ = velocity_training_pair(image, time_t)
-            predicted_velocity = model(model_input, time_t, [conditioner(labels)])[0]
-            total_loss += nn.functional.mse_loss(predicted_velocity, target_velocity).item()
+            target_corruption = corruption_target(image, model_input)
+            predicted_velocity, predicted_corruption = model(model_input, time_t, [conditioner(labels)])[0]
+            total_loss += r2id_training_loss(predicted_velocity, target_velocity, predicted_corruption, target_corruption).item()
             batches += 1
 
         losses_by_size[size] = total_loss / max(1, batches)
@@ -241,8 +254,9 @@ def evaluate_by_time(model: R2ID, conditioner: ClassLabelConditioner, dataloader
     for value in T_LOSS_VALUES:
         time_t = torch.full((image.shape[0],), float(value), device=device)
         model_input, target_velocity, _ = velocity_training_pair(image, time_t)
-        predicted_velocity = model(model_input, time_t, [conditioner(labels)])[0]
-        losses.append(nn.functional.mse_loss(predicted_velocity, target_velocity).item())
+        target_corruption = corruption_target(image, model_input)
+        predicted_velocity, predicted_corruption = model(model_input, time_t, [conditioner(labels)])[0]
+        losses.append(r2id_training_loss(predicted_velocity, target_velocity, predicted_corruption, target_corruption).item())
     return losses
 
 
@@ -285,6 +299,8 @@ def checkpoint_config() -> dict:
             "pos_freq": POS_FREQ,
             "time_freq": TIME_FREQ,
             "token_count": TOKEN_COUNT,
+            "corruption_loss_weight": CORRUPTION_LOSS_WEIGHT,
+            "corruption_target": "clean_image - model_input",
         },
     }
 
