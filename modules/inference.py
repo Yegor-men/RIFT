@@ -73,6 +73,7 @@ def render_checkpoint_samples(
         labels: str = "grid",
         batch_size: int = 100,
         sample_steps: int = 100,
+        schedule_scale: float = 1.0,
         cfg_scale: float = 1.0,
         device: str = "cuda",
         save: bool = False,
@@ -112,6 +113,7 @@ def render_checkpoint_samples(
             pos_text_cond=pos_tokens,
             null_text_cond=null_tokens,
             num_steps=sample_steps,
+            schedule_scale=schedule_scale,
             cfg_scale=cfg_scale,
             device=device_obj,
         )

@@ -19,6 +19,7 @@ SIZES = (32, 64, 128)
 LABELS = "grid"
 BATCH_SIZE = 100
 SAMPLE_STEPS = 100
+SCHEDULE_SCALE = 1.0
 CFG_SCALE = 1.0
 DEVICE = "cuda"
 SAVE_IMAGES = False
@@ -38,6 +39,7 @@ def main() -> None:
         labels=LABELS,
         batch_size=BATCH_SIZE,
         sample_steps=SAMPLE_STEPS,
+        schedule_scale=SCHEDULE_SCALE,
         cfg_scale=CFG_SCALE,
         device=DEVICE,
         save=SAVE_IMAGES,
