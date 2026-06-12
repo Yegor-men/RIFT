@@ -76,6 +76,19 @@ class ImageNorm(nn.Module):
         return torch.movedim(x, -1, -3)
 
 
+class ImageAdaLN(nn.Module):
+    def __init__(self, num_channels: int):
+        super().__init__()
+        self.norm = ImageNorm(num_channels, affine=False)
+        self.to_scale_shift = nn.Conv2d(num_channels, 2 * num_channels, 1)
+        nn.init.zeros_(self.to_scale_shift.weight)
+        nn.init.zeros_(self.to_scale_shift.bias)
+
+    def forward(self, image: torch.Tensor, evidence: torch.Tensor) -> torch.Tensor:
+        scale, shift = self.to_scale_shift(evidence).chunk(2, dim=1)
+        return self.norm(image) * (1.0 + scale) + shift
+
+
 class GRN(nn.Module):
     """Global Response Normalization: global channel competition without spatial mixing."""
 
@@ -240,47 +253,11 @@ class LinearSelfAttention(nn.Module):
         return attn_out.transpose(1, 2).view(b, d, h, w)
 
 
-class EncBlock(nn.Module):
-    def __init__(
-            self,
-            d_channels: int,
-            num_heads: int,
-            self_attn_dropout: float = 0.0,
-            ffn_dropout: float = 0.0,
-            linear_attention: bool = False,
-    ):
-        super().__init__()
-        self.d_channels = int(d_channels)
-        self_attn_cls = LinearSelfAttention if linear_attention else SelfAttention
-
-        self.self_norm = nn.Sequential(GRN(d_channels), ImageNorm(d_channels))
-        self.self_attn = self_attn_cls(d_channels=d_channels, num_heads=num_heads, dropout=self_attn_dropout)
-        self.self_scalar = nn.Parameter(torch.ones(d_channels))
-
-        self.ffn_norm = nn.Sequential(GRN(d_channels), ImageNorm(d_channels))
-        self.ffn = ImageFFN(d_channels, ffn_dropout)
-        self.ffn_scalar = nn.Parameter(torch.ones(d_channels))
-
-        self.final_scalar = nn.Parameter(torch.ones(d_channels) * 0.1)
-
-    def forward(self, image):
-        working_image = image
-
-        self_out = self.self_attn(self.self_norm(working_image))
-        working_image = working_image + self_out * self.self_scalar.view(1, self.d_channels, 1, 1)
-
-        ffn_out = self.ffn(self.ffn_norm(working_image))
-        working_image = working_image + ffn_out * self.ffn_scalar.view(1, self.d_channels, 1, 1)
-
-        return image + working_image * self.final_scalar.view(1, self.d_channels, 1, 1)
-
-
 class DecBlock(nn.Module):
     def __init__(
             self,
             d_channels: int,
             num_heads: int,
-            skip_channels: int = 0,
             self_attn_dropout: float = 0.0,
             cross_attn_dropout: float = 0.0,
             ffn_dropout: float = 0.0,
@@ -288,66 +265,68 @@ class DecBlock(nn.Module):
     ):
         super().__init__()
         self.d_channels = int(d_channels)
-        self.skip_channels = int(skip_channels)
-        if self.skip_channels not in (0, self.d_channels):
-            raise ValueError(f"DecBlock skip_channels must be 0 or d_channels ({self.d_channels}), got {self.skip_channels}")
-
-        self.work_channels = self.d_channels + self.skip_channels
-        self.work_heads = int(num_heads) * (2 if self.skip_channels > 0 else 1)
-        assert self.work_channels % self.work_heads == 0, (
-            f"work_channels ({self.work_channels}) must be divisible by work_heads ({self.work_heads})"
-        )
+        self.num_heads = int(num_heads)
 
         self_attn_cls = LinearSelfAttention if linear_attention else SelfAttention
         cross_attn_cls = LinearCrossAttention if linear_attention else CrossAttention
 
-        self.text_proj = nn.Identity() if self.work_channels == self.d_channels else nn.Linear(self.d_channels, self.work_channels)
-        self.cross_norm = nn.Sequential(GRN(self.work_channels), ImageNorm(self.work_channels))
-        self.cross_attn = cross_attn_cls(d_channels=self.work_channels, num_heads=self.work_heads, dropout=cross_attn_dropout)
-        self.cross_scalar = nn.Parameter(torch.ones(self.work_channels))
+        self.cross_norm = nn.Sequential(GRN(self.d_channels), ImageNorm(self.d_channels))
+        self.cross_attn = cross_attn_cls(d_channels=self.d_channels, num_heads=self.num_heads,
+                                         dropout=cross_attn_dropout)
 
-        self.self_norm = nn.Sequential(GRN(self.work_channels), ImageNorm(self.work_channels))
-        self.self_attn = self_attn_cls(d_channels=self.work_channels, num_heads=self.work_heads, dropout=self_attn_dropout)
-        self.self_scalar = nn.Parameter(torch.ones(self.work_channels))
+        self.self_grn = GRN(self.d_channels)
+        self.self_norm = ImageAdaLN(self.d_channels)
+        self.self_attn = self_attn_cls(d_channels=self.d_channels, num_heads=self.num_heads, dropout=self_attn_dropout)
+        self.self_scalar = nn.Parameter(torch.ones(self.d_channels))
 
-        self.ffn_norm = nn.Sequential(GRN(self.work_channels), ImageNorm(self.work_channels))
-        self.ffn = ImageFFN(self.work_channels, ffn_dropout)
-        self.ffn_scalar = nn.Parameter(torch.ones(self.work_channels))
+        self.ffn_grn = GRN(self.d_channels)
+        self.ffn_norm = ImageAdaLN(self.d_channels)
+        self.ffn = ImageFFN(self.d_channels, ffn_dropout)
+        self.ffn_scalar = nn.Parameter(torch.ones(self.d_channels))
 
-        self.output_proj = nn.Conv2d(self.work_channels, self.d_channels, 1)
-        nn.init.zeros_(self.output_proj.weight)
-        nn.init.zeros_(self.output_proj.bias)
-        with torch.no_grad():
-            eye = torch.eye(self.d_channels)
-            self.output_proj.weight[:, :self.d_channels, 0, 0].copy_(eye)
         self.final_scalar = nn.Parameter(torch.ones(d_channels) * 0.1)
 
-    def _make_working_image(self, image, skip_image):
-        if self.skip_channels <= 0:
-            return image
-        assert skip_image is not None, "Decoder block was built with skip channels but no skip image was passed"
-        assert skip_image.shape[-3] == self.skip_channels, (
-            f"Expected skip with {self.skip_channels} channels, got {skip_image.shape[-3]}"
-        )
-        return torch.cat([image, skip_image], dim=-3)
+    @staticmethod
+    def _strength_map(strength, reference: torch.Tensor) -> torch.Tensor:
+        if not torch.is_tensor(strength):
+            strength = torch.tensor(float(strength), device=reference.device, dtype=reference.dtype)
+        strength = strength.to(device=reference.device, dtype=reference.dtype)
+        if strength.ndim == 0:
+            return strength.view(1, 1, 1, 1)
+        if strength.ndim == 1:
+            return strength.view(strength.shape[0], 1, 1, 1)
+        if strength.ndim == reference.ndim:
+            return strength
+        raise ValueError(
+            f"Cannot use conditioning strength shape {tuple(strength.shape)} for image {tuple(reference.shape)}")
 
-    def forward(self, image, text_tokens, skip_image=None):
-        working_image = self._make_working_image(image, skip_image)
+    def _conditioning_evidence(self, image, text_conditions, evidence_scale: float):
+        evidence = torch.zeros_like(image)
+        normalizer = torch.ones((image.shape[0], 1, 1, 1), device=image.device, dtype=image.dtype)
+        if not text_conditions:
+            return evidence
 
-        cross_out = self.cross_attn(self.cross_norm(working_image), self.text_proj(text_tokens))
-        working_image = working_image + cross_out * self.cross_scalar.view(1, self.work_channels, 1, 1)
+        query_image = self.cross_norm(image)
+        for text_tokens, strength in text_conditions:
+            strength_map = self._strength_map(strength, image)
+            evidence = evidence + self.cross_attn(query_image, text_tokens) * strength_map
+            normalizer = normalizer + strength_map.abs()
+        return evidence / normalizer * float(evidence_scale)
 
-        self_out = self.self_attn(self.self_norm(working_image))
-        working_image = working_image + self_out * self.self_scalar.view(1, self.work_channels, 1, 1)
+    def forward(self, image, text_conditions, evidence_scale: float = 1.0):
+        working_image = image
+        evidence = self._conditioning_evidence(working_image, text_conditions, evidence_scale)
 
-        ffn_out = self.ffn(self.ffn_norm(working_image))
-        working_image = working_image + ffn_out * self.ffn_scalar.view(1, self.work_channels, 1, 1)
+        self_out = self.self_attn(self.self_norm(self.self_grn(working_image), evidence))
+        working_image = working_image + self_out * self.self_scalar.view(1, self.d_channels, 1, 1)
 
-        compressed_image = self.output_proj(working_image)
-        return image + compressed_image * self.final_scalar.view(1, self.d_channels, 1, 1)
+        ffn_out = self.ffn(self.ffn_norm(self.ffn_grn(working_image), evidence))
+        working_image = working_image + ffn_out * self.ffn_scalar.view(1, self.d_channels, 1, 1)
+
+        return image + working_image * self.final_scalar.view(1, self.d_channels, 1, 1)
 
 
-class R2ID(nn.Module):
+class RIFT(nn.Module):
     def __init__(
             self,
             d_channels: int,
@@ -356,50 +335,19 @@ class R2ID(nn.Module):
             c_channels: int = 1,
             pos_freq: int = 16,
             time_freq: int = 10,  # Kept for config/API compatibility; time conditioning is disabled.
-            enc_blocks: int | None = None,
-            dec_blocks: int | None = None,
-            time_high_freq: int | None = None,
-            time_low_freq: int = 0,
-            film_dim: int | None = None,
             self_attn_dropout: float = 0.0,
             cross_attn_dropout: float = 0.0,
             ffn_dropout: float = 0.0,
             linear_attention: bool = True,
-            skip_fusion: bool = True,
-            velocity_output_scale: float = 1.0,
     ):
         super().__init__()
-        if time_high_freq is not None:
-            time_freq = int(time_high_freq) + int(time_low_freq)
-
-        if block_count is not None:
-            if enc_blocks is not None and int(enc_blocks) != int(block_count):
-                raise ValueError("enc_blocks must match block_count when both are provided")
-            if dec_blocks is not None and int(dec_blocks) != int(block_count):
-                raise ValueError("dec_blocks must match block_count when both are provided")
-            enc_blocks = dec_blocks = int(block_count)
-        elif enc_blocks is None and dec_blocks is None:
-            enc_blocks = dec_blocks = 4
-        elif enc_blocks is None:
-            enc_blocks = int(dec_blocks)
-        elif dec_blocks is None:
-            dec_blocks = int(enc_blocks)
-
-        if int(enc_blocks) != int(dec_blocks):
-            raise ValueError("R2ID expects one block_count: enc_blocks and dec_blocks must match")
-
         self.c_channels = int(c_channels)
         self.d_channels = int(d_channels)
-        self.block_count = int(enc_blocks)
-        self.num_enc_blocks = self.block_count
-        self.num_dec_blocks = self.block_count
+        self.block_count = 8 if block_count is None else int(block_count)
         self.num_heads = int(num_heads)
         self.num_time_frequencies = int(time_freq)
         self.num_pos_frequencies = int(pos_freq)
-        self.film_dim = int(film_dim) if film_dim is not None else int(d_channels)
         self.linear_attention = bool(linear_attention)
-        self.skip_fusion = bool(skip_fusion)
-        self.velocity_output_scale = float(velocity_output_scale)
 
         input_channels = self.num_pos_frequencies * 4 * 2 + self.c_channels
         self.input_channels = int(input_channels)
@@ -410,22 +358,10 @@ class R2ID(nn.Module):
         nn.init.zeros_(self.latent_to_velocity.bias)
 
         self.pos_embed = PosEmbed2d(pos_freq)
-        self.enc_blocks = nn.ModuleList([
-            EncBlock(
-                d_channels=self.d_channels,
-                num_heads=self.num_heads,
-                self_attn_dropout=self_attn_dropout,
-                ffn_dropout=ffn_dropout,
-                linear_attention=linear_attention,
-            ) for _ in range(self.block_count)
-        ])
-
-        decoder_skip_channels = self.d_channels if self.skip_fusion else 0
         self.dec_blocks = nn.ModuleList([
             DecBlock(
                 d_channels=self.d_channels,
                 num_heads=self.num_heads,
-                skip_channels=decoder_skip_channels,
                 self_attn_dropout=self_attn_dropout,
                 cross_attn_dropout=cross_attn_dropout,
                 ffn_dropout=ffn_dropout,
@@ -443,49 +379,53 @@ class R2ID(nn.Module):
         print(f"Channels for color/positioning: {self.c_channels}/{total_pos_channels}, total: {total_channels}")
         print(f"Attention: {'linear gated' if self.linear_attention else 'full'}")
         print("Time conditioning: disabled")
-        print("Encoder text conditioning: disabled")
-        print("Decoder text conditioning: enabled")
-        if self.skip_fusion:
-            print(
-                f"Decoder skip attention: enabled, encoder_input_stack={self.num_enc_blocks}, "
-                f"decoder_work_channels={self.d_channels * 2}, decoder_heads={self.num_heads * 2}, "
-                f"raw_input_skip=no"
-            )
-        else:
-            print("Decoder skip attention: disabled")
+        print("Encoder blocks: disabled")
+        print("Skip fusion: disabled")
+        print("Text conditioning: evidence accumulation + per-pixel AdaLN")
+        print("Output: residual velocity x1-xt in [-1, 1]")
 
-    def forward(self, image: torch.Tensor, time: torch.Tensor, text_conds: list[torch.Tensor]):
+    @staticmethod
+    def _normalize_text_conditions(text_conds):
+        if text_conds is None:
+            return []
+        if torch.is_tensor(text_conds):
+            return [(text_conds, 1.0)]
+
+        normalized = []
+        for item in text_conds:
+            if item is None:
+                continue
+            if torch.is_tensor(item):
+                normalized.append((item, 1.0))
+            else:
+                if len(item) != 2:
+                    raise ValueError("Conditioning items must be tensors or (tokens, strength) pairs")
+                tokens, strength = item
+                normalized.append((tokens, strength))
+        return normalized
+
+    def forward(
+            self,
+            image: torch.Tensor,
+            time: torch.Tensor,
+            text_conds: list[torch.Tensor] | list[tuple[torch.Tensor, float | torch.Tensor]] | None,
+            evidence_scale: float = 1.0,
+    ):
         del time  # Time conditioning is intentionally disabled.
         assert image.ndim == 4, "Image must be batch, tensor shape of [B, C, H, W]"
         batch, _, height, width = image.shape
 
         pos_map = self.pos_embed(batch, height, width)
         latent = self.proj_to_latent(torch.cat([image, pos_map], dim=-3))
+        text_conditions = self._normalize_text_conditions(text_conds)
 
-        encoder_inputs = []
-        for enc_block in self.enc_blocks:
-            if self.skip_fusion:
-                encoder_inputs.append(latent)
-            latent = enc_block(latent)
-
-        if self.skip_fusion:
-            skip_sources = list(reversed(encoder_inputs))
-        else:
-            skip_sources = [None for _ in self.dec_blocks]
-
-        velocity_list = []
-        for token_sequence in text_conds:
-            lat = latent
-            for i, dec_block in enumerate(self.dec_blocks):
-                lat = dec_block(lat, token_sequence, skip_sources[i])
-            velocity = torch.tanh(self.latent_to_velocity(lat)) * self.velocity_output_scale
-            velocity_list.append(velocity)
-
-        return velocity_list
+        for dec_block in self.dec_blocks:
+            latent = dec_block(latent, text_conditions, evidence_scale=evidence_scale)
+        predicted_velocity = torch.tanh(self.latent_to_velocity(latent))
+        return [predicted_velocity]
 
 
-class R2IDLinear(R2ID):
+class RIFTLinear(RIFT):
     def __init__(self, *args, **kwargs):
-        kwargs.setdefault("skip_fusion", True)
         kwargs["linear_attention"] = True
         super().__init__(*args, **kwargs)

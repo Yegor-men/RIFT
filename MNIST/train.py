@@ -20,10 +20,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from modules.conditioning import ClassLabelConditioner
-from modules.r2id import R2ID
+from modules.rift import RIFT
 from modules.render_image import render_image
-from modules.sampling import run_velocity_sampling
-from modules.velocity import sample_noise, velocity_training_pair
+from modules.sampling import run_rift_sampling
+from modules.rift_diffusion import rift_training_pair, sample_noise, weighted_velocity_mse_loss
 
 # CONFIG ===============================================================================================================
 
@@ -37,11 +37,11 @@ IMAGE_SIZE = 28
 IMAGE_CHANNELS = 1
 NUM_CLASSES = 10
 
-D_CHANNELS = 192
-NUM_HEADS = 6
-BLOCK_COUNT = 4
-POS_FREQ = 16
-TIME_FREQ = 10
+D_CHANNELS = 256
+NUM_HEADS = 8
+BLOCK_COUNT = 8
+POS_FREQ = 4
+TIME_FREQ = 5
 TOKEN_COUNT = 2
 
 SELF_ATTN_DROPOUT = 0.0
@@ -55,15 +55,17 @@ NUM_WORKERS = 2
 LR = 1e-3
 LR_END = 1e-6
 EMA_DECAY = 0.999
-CFG_DROPOUT = 0.1
+VELOCITY_LOSS_WEIGHT = 1.0
+ALPHA_LOSS_WEIGHT_MAX = 100.0
 
 TEST_SIZES = (14, 28, 64)
-T_LOSS_VALUES = (0.01, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99)
+ALPHA_LOSS_VALUES = (0.00, 0.01, 0.10, 0.25, 0.50, 0.75, 0.90, 0.98, 1.00)
 SAMPLE_SIZES = (14, 28, 64)
-SAMPLE_SCHEDULE_SCALE = 1.0
-SAMPLE_STEPS = 30
+SAMPLE_STEP_SIZE = 0.05
+SAMPLE_STEPS = 20
 SAMPLE_COUNT = 10
-CFG_SCALE = 1.0
+CONDITION_STRENGTH = 1.0
+EVIDENCE_SCALE = 1.0
 
 SAMPLE_EVERY = 1
 SAVE_EVERY = 1
@@ -157,13 +159,6 @@ def update_ema(source: nn.Module, target: nn.Module) -> None:
         ema_param.data.mul_(EMA_DECAY).add_(param.data, alpha=1.0 - EMA_DECAY)
 
 
-def make_training_labels(labels: torch.Tensor, null_label: int) -> torch.Tensor:
-    if CFG_DROPOUT <= 0.0:
-        return labels
-    dropped = torch.rand(labels.shape, device=labels.device) < CFG_DROPOUT
-    return torch.where(dropped, torch.full_like(labels, null_label), labels)
-
-
 def label_grid(count: int, device: torch.device) -> torch.Tensor:
     labels = torch.arange(NUM_CLASSES, dtype=torch.long, device=device)
     repeats = (count + NUM_CLASSES - 1) // NUM_CLASSES
@@ -172,8 +167,8 @@ def label_grid(count: int, device: torch.device) -> torch.Tensor:
 
 # MODEL / LOSS =========================================================================================================
 
-def build_model(device: torch.device) -> R2ID:
-    return R2ID(
+def build_model(device: torch.device) -> RIFT:
+    return RIFT(
         c_channels=IMAGE_CHANNELS,
         d_channels=D_CHANNELS,
         num_heads=NUM_HEADS,
@@ -190,20 +185,32 @@ def build_conditioner(device: torch.device) -> ClassLabelConditioner:
     return ClassLabelConditioner(NUM_CLASSES, TOKEN_COUNT, D_CHANNELS).to(device)
 
 
-def velocity_prediction_loss(model: R2ID, conditioner: ClassLabelConditioner, image: torch.Tensor,
-                             labels: torch.Tensor):
+def rift_prediction_loss(model: RIFT, conditioner: ClassLabelConditioner, image: torch.Tensor,
+                         labels: torch.Tensor):
     image = image.clamp(0.0, 1.0)
-    model_input, target_velocity, _ = velocity_training_pair(image)
+    model_input, target_velocity, _, alpha_map = rift_training_pair(
+        image,
+    )
     model_time = torch.zeros(image.shape[0], device=image.device)
-    train_labels = make_training_labels(labels, conditioner.null_label)
-    predicted_velocity = model(model_input, model_time, [conditioner(train_labels)])[0]
-    return nn.functional.mse_loss(predicted_velocity, target_velocity)
+    condition_tokens = conditioner(labels)
+    predicted_velocity = model(
+        model_input,
+        model_time,
+        [(condition_tokens, CONDITION_STRENGTH)],
+        evidence_scale=EVIDENCE_SCALE,
+    )[0]
+    return VELOCITY_LOSS_WEIGHT * weighted_velocity_mse_loss(
+        predicted_velocity,
+        target_velocity,
+        alpha_map,
+        max_weight=ALPHA_LOSS_WEIGHT_MAX,
+    )
 
 
 # EVAL / SAMPLING ======================================================================================================
 
 @torch.no_grad()
-def evaluate(model: R2ID, conditioner: ClassLabelConditioner, dataloader: DataLoader, device: torch.device):
+def evaluate(model: RIFT, conditioner: ClassLabelConditioner, dataloader: DataLoader, device: torch.device):
     model.eval()
     conditioner.eval()
     losses_by_size = {}
@@ -219,10 +226,24 @@ def evaluate(model: R2ID, conditioner: ClassLabelConditioner, dataloader: DataLo
             image = resize_image(image, size).to(device).clamp(0.0, 1.0)
             labels = labels.to(device, dtype=torch.long)
 
-            model_input, target_velocity, _ = velocity_training_pair(image)
+            model_input, target_velocity, _, alpha_map = rift_training_pair(
+                image,
+            )
             model_time = torch.zeros(image.shape[0], device=device)
-            predicted_velocity = model(model_input, model_time, [conditioner(labels)])[0]
-            total_loss += nn.functional.mse_loss(predicted_velocity, target_velocity).item()
+            predicted_velocity = model(
+                model_input,
+                model_time,
+                [(conditioner(labels), CONDITION_STRENGTH)],
+                evidence_scale=EVIDENCE_SCALE,
+            )[0]
+            total_loss += (
+                    VELOCITY_LOSS_WEIGHT * weighted_velocity_mse_loss(
+                predicted_velocity,
+                target_velocity,
+                alpha_map,
+                max_weight=ALPHA_LOSS_WEIGHT_MAX,
+            )
+            ).item()
             batches += 1
 
         losses_by_size[size] = total_loss / max(1, batches)
@@ -231,7 +252,12 @@ def evaluate(model: R2ID, conditioner: ClassLabelConditioner, dataloader: DataLo
 
 
 @torch.no_grad()
-def evaluate_by_time(model: R2ID, conditioner: ClassLabelConditioner, dataloader: DataLoader, device: torch.device):
+def evaluate_by_alpha(
+        model: RIFT,
+        conditioner: ClassLabelConditioner,
+        dataloader: DataLoader,
+        device: torch.device,
+):
     model.eval()
     conditioner.eval()
     image, labels = next(iter(dataloader))
@@ -239,38 +265,48 @@ def evaluate_by_time(model: R2ID, conditioner: ClassLabelConditioner, dataloader
     labels = labels[:EVAL_BATCH_SIZE].to(device, dtype=torch.long)
 
     losses = []
-    for value in T_LOSS_VALUES:
-        uniform_t = torch.full((image.shape[0],), float(value), device=device)
-        model_input, target_velocity, _ = velocity_training_pair(image, uniform_t)
+    for value in ALPHA_LOSS_VALUES:
+        alpha = torch.full((image.shape[0],), float(value), device=device)
+        model_input, target_velocity, _, alpha_map = rift_training_pair(
+            image,
+            alpha=alpha,
+        )
         model_time = torch.zeros(image.shape[0], device=device)
-        predicted_velocity = model(model_input, model_time, [conditioner(labels)])[0]
-        losses.append(nn.functional.mse_loss(predicted_velocity, target_velocity).item())
+        predicted_velocity = model(
+            model_input,
+            model_time,
+            [(conditioner(labels), CONDITION_STRENGTH)],
+            evidence_scale=EVIDENCE_SCALE,
+        )[0]
+        loss = VELOCITY_LOSS_WEIGHT * weighted_velocity_mse_loss(
+            predicted_velocity,
+            target_velocity,
+            alpha_map,
+            max_weight=ALPHA_LOSS_WEIGHT_MAX,
+        )
+        losses.append(loss.item())
     return losses
 
 
 @torch.no_grad()
-def render_samples(model: R2ID, conditioner: ClassLabelConditioner, epoch: int, device: torch.device) -> None:
+def render_samples(model: RIFT, conditioner: ClassLabelConditioner, epoch: int, device: torch.device) -> None:
     model.eval()
     conditioner.eval()
     labels = label_grid(SAMPLE_COUNT, device)
-    pos_tokens = conditioner(labels)
-    null_tokens = None
-    if CFG_SCALE != 1.0:
-        null_tokens = conditioner(torch.full_like(labels, conditioner.null_label))
+    text_conditions = [(conditioner(labels), CONDITION_STRENGTH)]
 
     for size in SAMPLE_SIZES:
         initial_noise = sample_noise((labels.shape[0], IMAGE_CHANNELS, size, size), device=device)
-        samples, _ = run_velocity_sampling(
+        samples, _ = run_rift_sampling(
             model=model,
             initial_noise=initial_noise,
-            pos_text_cond=pos_tokens,
-            null_text_cond=null_tokens,
+            text_conditions=text_conditions,
             num_steps=SAMPLE_STEPS,
-            schedule_scale=SAMPLE_SCHEDULE_SCALE,
-            cfg_scale=CFG_SCALE,
+            step_size=SAMPLE_STEP_SIZE,
+            evidence_scale=EVIDENCE_SCALE,
             device=device,
         )
-        render_image(samples, title=f"MNIST R2ID | E{epoch + 1} | {size}px")
+        render_image(samples, title=f"MNIST RIFT | E{epoch + 1} | {size}px")
 
 
 # SAVE / PLOT ==========================================================================================================
@@ -289,21 +325,27 @@ def checkpoint_config() -> dict:
             "time_freq": TIME_FREQ,
             "token_count": TOKEN_COUNT,
             "time_conditioning": False,
-            "velocity_target": "clean_image - corrupted_image",
-            "model_input": "t * clean_image + (1 - t) * noise",
-            "alpha_sampling": "alpha = per_image_rand * per_pixel_rand; t = 1 - alpha",
-            "t_definition": "t=0 noise, t=1 clean",
+            "prediction_target": "velocity = clean_image - x_t",
+            "model_input": "x_t = (1 - alpha) * clean_image + alpha * x0_noise",
+            "x0_sampling": "x0_noise = torch.rand_like(clean_image)",
+            "alpha_sampling": "per-image alpha U(0, 1)",
+            "loss": "per-image MSE scaled by min(alpha^-2, 100), normalized by sum of batch weights",
+            "sampler": "x_next = clamp(x + step_size * predicted_velocity)",
+            "conditioning": "evidence accumulation with per-condition strengths and per-pixel AdaLN",
+            "evidence_scale": EVIDENCE_SCALE,
+            "sample_steps": SAMPLE_STEPS,
+            "sample_step_size": SAMPLE_STEP_SIZE,
         },
     }
 
 
-def save_checkpoint(model: R2ID, conditioner: ClassLabelConditioner, epoch: int, test_loss: float) -> None:
+def save_checkpoint(model: RIFT, conditioner: ClassLabelConditioner, epoch: int, test_loss: float) -> None:
     folder = Path(OUTPUT_DIR)
     folder.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     stem = f"MNIST_E{epoch + 1:03d}_{test_loss:.5f}_{timestamp}"
 
-    save_file(model.state_dict(), str(folder / f"{stem}_r2id.safetensors"))
+    save_file(model.state_dict(), str(folder / f"{stem}_rift.safetensors"))
     save_file(conditioner.state_dict(), str(folder / f"{stem}_conditioner.safetensors"))
     with open(folder / f"{stem}_config.json", "w", encoding="utf-8") as handle:
         json.dump(checkpoint_config(), handle, indent=2)
@@ -315,7 +357,7 @@ def plot_history(history: dict, epoch: int) -> None:
         return
 
     plt.figure()
-    plt.title("MNIST R2ID Velocity Loss")
+    plt.title("MNIST RIFT Alpha-Weighted Residual Velocity Loss")
     plt.plot(history["train"], label="train")
     plt.plot(history["test"], label="test avg")
     plt.legend()
@@ -323,7 +365,7 @@ def plot_history(history: dict, epoch: int) -> None:
     plt.show()
 
     plt.figure()
-    plt.title("MNIST R2ID Test Loss by Resolution")
+    plt.title("MNIST RIFT Test Loss by Resolution")
     for size, values in history["test_by_size"].items():
         plt.plot(values, label=f"{size}px")
     plt.legend()
@@ -331,10 +373,10 @@ def plot_history(history: dict, epoch: int) -> None:
     plt.show()
 
     plt.figure()
-    plt.title("MNIST R2ID Loss by Uniform t")
-    t_history = torch.tensor(history["t_losses"])
-    for idx, value in enumerate(T_LOSS_VALUES):
-        plt.plot(t_history[:, idx].tolist(), label=f"t={value:.2f}")
+    plt.title("MNIST RIFT Loss by Fixed Alpha")
+    alpha_history = torch.tensor(history["alpha_losses"])
+    for idx, value in enumerate(ALPHA_LOSS_VALUES):
+        plt.plot(alpha_history[:, idx].tolist(), label=f"alpha={value:.2f}")
     plt.legend()
     plt.tight_layout()
     plt.show()
@@ -350,7 +392,7 @@ def main() -> None:
     device = torch.device(DEVICE if DEVICE != "cuda" or torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     print(
-        f"MNIST R2ID: image={IMAGE_SIZE}px, d={D_CHANNELS}, heads={NUM_HEADS}, blocks={BLOCK_COUNT}, "
+        f"MNIST RIFT: image={IMAGE_SIZE}px, d={D_CHANNELS}, heads={NUM_HEADS}, blocks={BLOCK_COUNT}, "
         f"pos_freq={POS_FREQ}, time_freq={TIME_FREQ}"
     )
 
@@ -375,7 +417,7 @@ def main() -> None:
         param.requires_grad = False
 
     conditioner = build_conditioner(device)
-    print(f"R2ID parameters: {format_parameters(count_parameters(model))}")
+    print(f"RIFT parameters: {format_parameters(count_parameters(model))}")
     print(f"Conditioner parameters: {format_parameters(count_parameters(conditioner))}")
     model.print_model_summary()
 
@@ -386,7 +428,7 @@ def main() -> None:
         "train": [],
         "test": [],
         "test_by_size": {size: [] for size in TEST_SIZES},
-        "t_losses": [],
+        "alpha_losses": [],
     }
     start = time.time()
 
@@ -402,7 +444,7 @@ def main() -> None:
 
             image = image.to(device).clamp(0.0, 1.0)
             labels = labels.to(device, dtype=torch.long)
-            loss = velocity_prediction_loss(model, conditioner, image, labels)
+            loss = rift_prediction_loss(model, conditioner, image, labels)
 
             loss.backward()
             optimizer.step()
@@ -416,17 +458,20 @@ def main() -> None:
         train_loss = total_train_loss / max(1, train_batches)
         test_by_size = evaluate(ema_model, conditioner, test_loader, device)
         test_loss = sum(test_by_size.values()) / max(1, len(test_by_size))
-        t_losses = evaluate_by_time(ema_model, conditioner, test_loader, device)
+        alpha_losses = evaluate_by_alpha(ema_model, conditioner, test_loader, device)
 
         history["train"].append(train_loss)
         history["test"].append(test_loss)
-        history["t_losses"].append(t_losses)
+        history["alpha_losses"].append(alpha_losses)
         for size, loss_value in test_by_size.items():
             history["test_by_size"][size].append(loss_value)
 
         print(f"Epoch {epoch + 1} | TRAIN: {train_loss:.5f} | TEST: {test_loss:.5f}")
         print("Test by size:", " | ".join(f"{size}px: {loss:.5f}" for size, loss in test_by_size.items()))
-        print("T-losses:", " | ".join(f"t={t:.2f}: {loss:.5f}" for t, loss in zip(T_LOSS_VALUES, t_losses)))
+        print("Alpha losses:", " | ".join(
+            f"alpha={alpha:.2f}: {loss:.5f}"
+            for alpha, loss in zip(ALPHA_LOSS_VALUES, alpha_losses)
+        ))
 
         plot_history(history, epoch)
 

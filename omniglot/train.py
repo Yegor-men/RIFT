@@ -20,7 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from modules.conditioning import ClassLabelConditioner
-from modules.r2id import R2ID
+from modules.rift import RIFT
 from modules.render_image import render_image
 from modules.sampling import run_velocity_sampling
 from modules.velocity import sample_noise, velocity_training_pair
@@ -39,7 +39,7 @@ IMAGE_CHANNELS = 1
 
 D_CHANNELS = 192
 NUM_HEADS = 6
-BLOCK_COUNT = 4
+BLOCK_COUNT = 8
 POS_FREQ = 16
 TIME_FREQ = 10
 TOKEN_COUNT = 2
@@ -55,15 +55,16 @@ NUM_WORKERS = 2
 LR = 1e-3
 LR_END = 1e-6
 EMA_DECAY = 0.999
-CFG_DROPOUT = 0.1
+CONDITION_DROPOUT = 0.2
 
 TEST_SIZES = (32, 64, 128)
 T_LOSS_VALUES = (0.01, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99)
 SAMPLE_SIZES = (32, 64, 128)
 SAMPLE_STEPS = 100
-SAMPLE_SCHEDULE_SCALE = 1.0
+SAMPLE_STEP_SIZE = 1.0
 SAMPLE_COUNT = 100
-CFG_SCALE = 1.0
+CONDITION_STRENGTH = 1.0
+EVIDENCE_SCALE = 1.0
 
 SAMPLE_EVERY = 1
 SAVE_EVERY = 0
@@ -158,11 +159,12 @@ def update_ema(source: nn.Module, target: nn.Module) -> None:
         ema_param.data.mul_(EMA_DECAY).add_(param.data, alpha=1.0 - EMA_DECAY)
 
 
-def make_training_labels(labels: torch.Tensor, null_label: int) -> torch.Tensor:
-    if CFG_DROPOUT <= 0.0:
-        return labels
-    dropped = torch.rand(labels.shape, device=labels.device) < CFG_DROPOUT
-    return torch.where(dropped, torch.full_like(labels, null_label), labels)
+def make_training_strengths(labels: torch.Tensor) -> torch.Tensor:
+    strengths = torch.ones(labels.shape, device=labels.device)
+    if CONDITION_DROPOUT <= 0.0:
+        return strengths
+    dropped = torch.rand(labels.shape, device=labels.device) < CONDITION_DROPOUT
+    return torch.where(dropped, torch.zeros_like(strengths), strengths)
 
 
 def label_grid(num_classes: int, count: int, device: torch.device) -> torch.Tensor:
@@ -175,8 +177,8 @@ def label_grid(num_classes: int, count: int, device: torch.device) -> torch.Tens
 
 # MODEL / LOSS =========================================================================================================
 
-def build_model(device: torch.device) -> R2ID:
-    return R2ID(
+def build_model(device: torch.device) -> RIFT:
+    return RIFT(
         c_channels=IMAGE_CHANNELS,
         d_channels=D_CHANNELS,
         num_heads=NUM_HEADS,
@@ -193,19 +195,20 @@ def build_conditioner(device: torch.device, num_classes: int) -> ClassLabelCondi
     return ClassLabelConditioner(num_classes, TOKEN_COUNT, D_CHANNELS).to(device)
 
 
-def velocity_prediction_loss(model: R2ID, conditioner: ClassLabelConditioner, image: torch.Tensor, labels: torch.Tensor):
+def velocity_prediction_loss(model: RIFT, conditioner: ClassLabelConditioner, image: torch.Tensor, labels: torch.Tensor):
     image = image.clamp(0.0, 1.0)
     model_input, target_velocity, _ = velocity_training_pair(image)
     model_time = torch.zeros(image.shape[0], device=image.device)
-    train_labels = make_training_labels(labels, conditioner.null_label)
-    predicted_velocity = model(model_input, model_time, [conditioner(train_labels)])[0]
+    condition_tokens = conditioner(labels)
+    condition_strengths = make_training_strengths(labels)
+    predicted_velocity = model(model_input, model_time, [(condition_tokens, condition_strengths)])[0]
     return nn.functional.mse_loss(predicted_velocity, target_velocity)
 
 
 # EVAL / SAMPLING ======================================================================================================
 
 @torch.no_grad()
-def evaluate(model: R2ID, conditioner: ClassLabelConditioner, dataloader: DataLoader, device: torch.device):
+def evaluate(model: RIFT, conditioner: ClassLabelConditioner, dataloader: DataLoader, device: torch.device):
     model.eval()
     conditioner.eval()
     losses_by_size = {}
@@ -223,7 +226,7 @@ def evaluate(model: R2ID, conditioner: ClassLabelConditioner, dataloader: DataLo
 
             model_input, target_velocity, _ = velocity_training_pair(image)
             model_time = torch.zeros(image.shape[0], device=device)
-            predicted_velocity = model(model_input, model_time, [conditioner(labels)])[0]
+            predicted_velocity = model(model_input, model_time, [(conditioner(labels), CONDITION_STRENGTH)])[0]
             total_loss += nn.functional.mse_loss(predicted_velocity, target_velocity).item()
             batches += 1
 
@@ -233,7 +236,7 @@ def evaluate(model: R2ID, conditioner: ClassLabelConditioner, dataloader: DataLo
 
 
 @torch.no_grad()
-def evaluate_by_time(model: R2ID, conditioner: ClassLabelConditioner, dataloader: DataLoader, device: torch.device):
+def evaluate_by_time(model: RIFT, conditioner: ClassLabelConditioner, dataloader: DataLoader, device: torch.device):
     model.eval()
     conditioner.eval()
     image, labels = next(iter(dataloader))
@@ -245,31 +248,27 @@ def evaluate_by_time(model: R2ID, conditioner: ClassLabelConditioner, dataloader
         uniform_t = torch.full((image.shape[0],), float(value), device=device)
         model_input, target_velocity, _ = velocity_training_pair(image, uniform_t)
         model_time = torch.zeros(image.shape[0], device=device)
-        predicted_velocity = model(model_input, model_time, [conditioner(labels)])[0]
+        predicted_velocity = model(model_input, model_time, [(conditioner(labels), CONDITION_STRENGTH)])[0]
         losses.append(nn.functional.mse_loss(predicted_velocity, target_velocity).item())
     return losses
 
 
 @torch.no_grad()
-def render_samples(model: R2ID, conditioner: ClassLabelConditioner, epoch: int, device: torch.device, num_classes: int) -> None:
+def render_samples(model: RIFT, conditioner: ClassLabelConditioner, epoch: int, device: torch.device, num_classes: int) -> None:
     model.eval()
     conditioner.eval()
     labels = label_grid(num_classes, SAMPLE_COUNT, device)
-    pos_tokens = conditioner(labels)
-    null_tokens = None
-    if CFG_SCALE != 1.0:
-        null_tokens = conditioner(torch.full_like(labels, conditioner.null_label))
+    text_conditions = [(conditioner(labels), CONDITION_STRENGTH)]
 
     for size in SAMPLE_SIZES:
         initial_noise = sample_noise((labels.shape[0], IMAGE_CHANNELS, size, size), device=device)
         samples, _ = run_velocity_sampling(
             model=model,
             initial_noise=initial_noise,
-            pos_text_cond=pos_tokens,
-            null_text_cond=null_tokens,
+            text_conditions=text_conditions,
             num_steps=SAMPLE_STEPS,
-            schedule_scale=SAMPLE_SCHEDULE_SCALE,
-            cfg_scale=CFG_SCALE,
+            step_size=SAMPLE_STEP_SIZE,
+            evidence_scale=EVIDENCE_SCALE,
             device=device,
         )
         render_image(samples, title=f"Omniglot R2ID | E{epoch + 1} | {size}px")
@@ -292,14 +291,17 @@ def checkpoint_config(num_classes: int) -> dict:
             "token_count": TOKEN_COUNT,
             "time_conditioning": False,
             "velocity_target": "clean_image - corrupted_image",
-            "model_input": "t * clean_image + (1 - t) * noise",
-            "alpha_sampling": "alpha = per_image_rand * per_pixel_rand; t = 1 - alpha",
+            "model_input": "where(pixel_rand >= t_threshold, noise, clean_image)",
+            "mask_sampling": "t_threshold = per_image_rand when random; fixed t is used as the threshold",
             "t_definition": "t=0 noise, t=1 clean",
+            "conditioning": "evidence accumulation with per-condition strengths and per-pixel AdaLN",
+            "condition_dropout": CONDITION_DROPOUT,
+            "evidence_scale": EVIDENCE_SCALE,
         },
     }
 
 
-def save_checkpoint(model: R2ID, conditioner: ClassLabelConditioner, epoch: int, test_loss: float, num_classes: int) -> None:
+def save_checkpoint(model: RIFT, conditioner: ClassLabelConditioner, epoch: int, test_loss: float, num_classes: int) -> None:
     folder = Path(OUTPUT_DIR)
     folder.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

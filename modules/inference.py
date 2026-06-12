@@ -5,20 +5,20 @@ import torch
 from safetensors.torch import load_file
 
 from modules.conditioning import ClassLabelConditioner
-from modules.r2id import R2ID
+from modules.rift import RIFT
 from modules.render_image import render_image
-from modules.sampling import run_velocity_sampling
-from modules.velocity import sample_noise
+from modules.sampling import run_rift_sampling
+from modules.rift_diffusion import sample_noise
 
 
 def infer_sidecar_path(model_path: Path, suffix: str) -> Path:
-    stem = model_path.name.removesuffix("_r2id.safetensors")
+    stem = model_path.name.removesuffix("_rift.safetensors")
     return model_path.with_name(f"{stem}_{suffix}")
 
 
 def newest_checkpoint_path(model_dir: str | Path, dataset_name: str | None = None) -> Path:
     model_dir = Path(model_dir)
-    pattern = f"{dataset_name}_E*_r2id.safetensors" if dataset_name else "*_E*_r2id.safetensors"
+    pattern = f"{dataset_name}_E*_rift.safetensors" if dataset_name else "*_E*_rift.safetensors"
     candidates = sorted(model_dir.glob(pattern), key=lambda path: path.stat().st_mtime)
     if not candidates:
         raise FileNotFoundError(f"No checkpoints matching {pattern!r} found in {model_dir}")
@@ -34,7 +34,7 @@ def load_checkpoint_config(model_path: str | Path, config_path: str | Path | Non
 
 def build_model_from_config(config: dict, device: torch.device):
     model_config = config["model"]
-    model = R2ID(
+    model = RIFT(
         c_channels=model_config["image_channels"],
         d_channels=model_config["d_channels"],
         num_heads=model_config["num_heads"],
@@ -72,9 +72,11 @@ def render_checkpoint_samples(
         sizes: tuple[int, ...] = (28, 64, 128),
         labels: str = "grid",
         batch_size: int = 100,
-        sample_steps: int = 100,
-        schedule_scale: float = 1.0,
-        cfg_scale: float = 1.0,
+        sample_steps: int = 20,
+        step_size: float = 0.05,
+        invert_steps: int = 0,
+        condition_strength: float = 1.0,
+        evidence_scale: float = 1.0,
         device: str = "cuda",
         save: bool = False,
 ) -> None:
@@ -97,29 +99,26 @@ def render_checkpoint_samples(
     print(f"Loaded conditioner: {conditioner_path}")
 
     sample_labels = parse_label_list(labels, batch_size, model_config["num_classes"], device_obj)
-    pos_tokens = conditioner(sample_labels)
-    null_tokens = None
-    if float(cfg_scale) != 1.0:
-        null_tokens = conditioner(torch.full_like(sample_labels, conditioner.null_label))
+    text_conditions = [(conditioner(sample_labels), float(condition_strength))]
 
     for size in sizes:
         initial_noise = sample_noise(
             (sample_labels.shape[0], model_config["image_channels"], size, size),
             device=device_obj,
         )
-        samples, _ = run_velocity_sampling(
+        samples, _ = run_rift_sampling(
             model=model,
             initial_noise=initial_noise,
-            pos_text_cond=pos_tokens,
-            null_text_cond=null_tokens,
+            text_conditions=text_conditions,
             num_steps=sample_steps,
-            schedule_scale=schedule_scale,
-            cfg_scale=cfg_scale,
+            step_size=step_size,
+            invert_steps=invert_steps,
+            evidence_scale=evidence_scale,
             device=device_obj,
         )
         render_image(
             samples.clamp(0.0, 1.0),
-            title=f"{title_prefix} R2ID | {size}px",
-            name=f"{title_prefix.lower()}_r2id_{size}px",
+            title=f"{title_prefix} RIFT | {size}px",
+            name=f"{title_prefix.lower()}_rift_{size}px",
             save=save,
         )

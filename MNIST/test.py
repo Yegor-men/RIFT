@@ -7,7 +7,6 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import torch
 from safetensors.torch import load_file
-from torch import nn
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from tqdm import tqdm
@@ -18,15 +17,20 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from modules.conditioning import ClassLabelConditioner
 from modules.inference import newest_checkpoint_path
-from modules.r2id import R2ID
-from modules.velocity import sample_noise, scheduled_residual_step, velocity_training_pair
+from modules.rift import RIFT
+from modules.rift_diffusion import (
+    rift_training_pair,
+    rift_velocity_step,
+    sample_noise,
+    weighted_velocity_mse_loss,
+)
 
 __test__ = False  # This is a plotting script, not a pytest test module.
 
 # CONFIG ===============================================================================================================
 
 MODEL_DIR = Path(__file__).resolve().parent / "models"
-MODEL_PATH = None  # If None, use newest MNIST_E*_r2id.safetensors from MODEL_DIR.
+MODEL_PATH = None  # If None, use newest MNIST_E*_rift.safetensors from MODEL_DIR.
 CONDITIONER_PATH = None  # If None, inferred from MODEL_PATH.
 CONFIG_PATH = None  # If None, inferred from MODEL_PATH.
 
@@ -36,27 +40,33 @@ SEED = 0
 SAVE_FIGURES = False
 FIGURE_DIR = Path("MNIST/media/tests")
 
-CFG_SCALE = 1.0
-SAMPLE_STEPS = 30
-SAMPLE_SCHEDULE_SCALE = 1.0
-TRAJECTORY_STEP_COUNT = 10  # Number of timestep rows to show; snapshots are sub-sampled from SAMPLE_STEPS.
-CLEAN_START_STEPS = 30
-CLEAN_START_SCHEDULE_SCALE = 1.0
+SAMPLE_NUM_STEPS = 10
+TRAJECTORY_STEP_COUNT = SAMPLE_NUM_STEPS + 1  # Show every image step for default traces.
+SAMPLE_STEP_SIZE = 0.2
+SAMPLE_EVIDENCE_SCALE = 1.0
+
+CLEAN_START_NUM_STEPS = 20
+CLEAN_START_STEP_SIZE = 0.3
+CLEAN_START_INVERT_STEPS = 10
+CLEAN_START_EVIDENCE_SCALE = 1.0
+CLEAN_START_ALPHA = 0.01
+
+LABEL_EVIDENCE_STRENGTH = 1.0
 
 SQUARE_SIZES = (20, 28, 48)
 # ASPECT_EDGE_LENGTHS = (28, 32, 36, 40)
 ASPECT_EDGE_LENGTHS = (28, 32)
 
-T_SCRAPE_POINTS = 50
-T_SCRAPE_BATCH_SIZE = 64
-T_SCRAPE_MAX_BATCHES = 8
-T_SCRAPE_IMAGE_SIZE = 28
+ALPHA_SCRAPE_POINTS = 10
+ALPHA_SCRAPE_BATCH_SIZE = 64
+ALPHA_SCRAPE_MAX_BATCHES = 8
+ALPHA_SCRAPE_IMAGE_SIZE = 28
 
 RUN_SQUARE_TRAJECTORIES = True
 RUN_ASPECT_RATIO_GRID = True
-RUN_T_SCRAPE_LOSS = True
+RUN_ALPHA_SCRAPE_LOSS = True
 RUN_CLEAN_START_TRAJECTORY = True
-CLEAN_START_SHOW_VELOCITY = False
+CLEAN_START_SHOW_MODEL_OUTPUTS = True
 
 
 # DATA =================================================================================================================
@@ -101,7 +111,7 @@ def newest_model_path() -> Path:
 
 
 def sidecar_path(model_path: Path, suffix: str) -> Path:
-    stem = model_path.name.removesuffix("_r2id.safetensors")
+    stem = model_path.name.removesuffix("_rift.safetensors")
     return model_path.with_name(f"{stem}_{suffix}")
 
 
@@ -115,7 +125,7 @@ def load_checkpoint(device: torch.device):
         config = json.load(handle)
     model_config = config["model"]
 
-    model = R2ID(
+    model = RIFT(
         c_channels=model_config["image_channels"],
         d_channels=model_config["d_channels"],
         num_heads=model_config["num_heads"],
@@ -171,33 +181,32 @@ def clean_digit_batch(image_size: int, device: torch.device) -> tuple[torch.Tens
 
 
 @torch.no_grad()
-def predict_velocity(model, conditioner, x, labels, t_for_model, cfg_scale: float):
-    pos_tokens = conditioner(labels)
-    if cfg_scale == 1.0:
-        return model(x, t_for_model, [pos_tokens])[0]
-
-    null_labels = torch.full_like(labels, conditioner.null_label)
-    null_tokens = conditioner(null_labels)
-    v_null, v_pos = model(x, t_for_model, [null_tokens, pos_tokens])
-    return v_null + cfg_scale * (v_pos - v_null)
+def predict_rift_fields(model, conditioner, x, labels, model_time, label_strength: float, evidence_scale: float):
+    text_conditions = [(conditioner(labels), label_strength)]
+    return model(x, model_time, text_conditions, evidence_scale=evidence_scale)
 
 
 @torch.no_grad()
 def sample_with_trace(
-        model: R2ID,
+        model: RIFT,
         conditioner: ClassLabelConditioner,
         labels: torch.Tensor,
         height: int,
         width: int,
-        steps: int,
+        num_steps: int,
         device: torch.device,
-        forced_t: float | None = None,
-        cfg_scale: float = 1.0,
+        label_strength: float = 1.0,
+        evidence_scale: float = 1.0,
         initial_x: torch.Tensor | None = None,
-        schedule_scale: float = 1.0,
+        step_size: float = 0.1,
+        invert_steps: int = 0,
 ):
-    if steps <= 0:
-        raise ValueError(f"steps must be positive, got {steps}")
+    if num_steps <= 0:
+        raise ValueError(f"steps must be positive, got {num_steps}")
+    if step_size < 0.0:
+        raise ValueError(f"step_size must be non-negative, got {step_size}")
+    if invert_steps < 0 or invert_steps > num_steps:
+        raise ValueError(f"invert_steps must be in [0, num_steps], got {invert_steps}")
 
     if initial_x is None:
         x = sample_noise((labels.shape[0], 1, height, width), device=device)
@@ -208,28 +217,27 @@ def sample_with_trace(
                 f"initial_x shape {tuple(x.shape)} does not match labels/size {(labels.shape[0], 1, height, width)}")
     image_trace = [x.detach().cpu()]
     velocity_trace = []
-    used_t_values = []
-    scheduler_t = torch.linspace(0.0, 1.0, steps=steps + 1, device=device)
+    model_time_values = []
 
-    for step in range(steps):
-        if forced_t is None:
-            t_for_model = torch.zeros((labels.shape[0],), device=device)
-        else:
-            t_for_model = torch.full((labels.shape[0],), float(forced_t), device=device)
+    for step in range(num_steps):
+        model_time = torch.zeros((labels.shape[0],), device=device)
 
-        v = predict_velocity(model, conditioner, x.clamp(0.0, 1.0), labels, t_for_model, cfg_scale)
-        velocity_trace.append(v.detach().cpu())
-        used_t_values.append(float(t_for_model[0].item()))
-        x = scheduled_residual_step(
-            x,
-            v,
-            t_current=float(scheduler_t[step].item()),
-            t_next=float(scheduler_t[step + 1].item()),
-            schedule_scale=schedule_scale,
-        )
+        predicted_velocity = predict_rift_fields(
+            model,
+            conditioner,
+            x.clamp(0.0, 1.0),
+            labels,
+            model_time,
+            label_strength,
+            evidence_scale,
+        )[0]
+        velocity_trace.append(predicted_velocity.detach().cpu())
+        model_time_values.append(float(model_time[0].item()))
+        signed_step_size = -float(step_size) if step < invert_steps else float(step_size)
+        x = rift_velocity_step(x, predicted_velocity, step_size=signed_step_size)
         image_trace.append(x.detach().cpu())
 
-    return image_trace, velocity_trace, used_t_values
+    return image_trace, velocity_trace, model_time_values
 
 
 # PLOTTING =============================================================================================================
@@ -279,7 +287,7 @@ def show_trace_grid(
         name: str,
         labels: torch.Tensor,
         value_range: tuple[float, float] = (0.0, 1.0),
-        map_velocity: bool = False,
+        map_signed: bool = False,
         column_titles: list[str] | None = None,
 ) -> None:
     row_indices = pick_trace_indices(len(trace), TRAJECTORY_STEP_COUNT)
@@ -291,7 +299,7 @@ def show_trace_grid(
 
     for row, trace_idx in enumerate(row_indices):
         images = trace[trace_idx].detach().cpu()
-        if map_velocity:
+        if map_signed:
             signed_images = images.clamp(-1.0, 1.0)
             red = signed_images.clamp(min=0.0)
             blue = (-signed_images).clamp(min=0.0)
@@ -318,15 +326,15 @@ def show_trace_grid(
     plt.show()
 
 
-def show_t_loss_curve(t_values: torch.Tensor, losses: list[float]) -> None:
+def show_alpha_loss_curve(alpha_values: torch.Tensor, losses: list[float]) -> None:
     plt.figure(figsize=(10, 4))
-    plt.title("MNIST R2ID velocity MSE across fixed t values")
-    plt.plot(t_values.cpu().tolist(), losses)
-    plt.xlabel("uniform t used to construct x_t; 0=noise, 1=clean")
-    plt.ylabel("MSE(predicted residual, clean - x_t)")
+    plt.title("MNIST RIFT residual velocity loss across fixed alpha values")
+    plt.plot(alpha_values.cpu().tolist(), losses)
+    plt.xlabel("global alpha used for x_t = (1 - alpha) * x1 + alpha * x0_noise")
+    plt.ylabel("MSE(predicted velocity, x1 - x_t)")
     plt.grid(True, alpha=0.25)
     plt.tight_layout()
-    maybe_savefig("t_scrape_loss_curve")
+    maybe_savefig("alpha_scrape_loss_curve")
     plt.show()
 
 
@@ -341,24 +349,25 @@ def run_square_resolution_trajectories(model, conditioner, device):
             labels=labels,
             height=size,
             width=size,
-            steps=SAMPLE_STEPS,
+            num_steps=SAMPLE_NUM_STEPS,
             device=device,
-            forced_t=None,
-            cfg_scale=CFG_SCALE,
-            schedule_scale=SAMPLE_SCHEDULE_SCALE,
+            label_strength=LABEL_EVIDENCE_STRENGTH,
+            evidence_scale=SAMPLE_EVIDENCE_SCALE,
+            step_size=SAMPLE_STEP_SIZE,
         )
         show_trace_grid(
             image_trace,
-            title=f"1:1 diffusion trajectory | {size}x{size}",
+            title=f"1:1 RIFT trajectory | {size}x{size}",
             name=f"square_{size}_image_trace",
             labels=labels.cpu(),
         )
         show_trace_grid(
             velocity_trace,
-            title=f"1:1 model velocity outputs | {size}x{size}",
-            name=f"square_{size}_velocity_trace",
+            title=f"1:1 predicted residual velocity | {size}x{size}",
+            name=f"square_{size}_predicted_velocity_trace",
             labels=labels.cpu(),
-            map_velocity=True,
+            value_range=(-1.0, 1.0),
+            map_signed=True,
         )
 
 
@@ -374,11 +383,11 @@ def run_aspect_ratio_grid(model, conditioner, device):
                 labels=labels,
                 height=height,
                 width=width,
-                steps=SAMPLE_STEPS,
+                num_steps=SAMPLE_NUM_STEPS,
                 device=device,
-                forced_t=None,
-                cfg_scale=CFG_SCALE,
-                schedule_scale=SAMPLE_SCHEDULE_SCALE,
+                label_strength=LABEL_EVIDENCE_STRENGTH,
+                evidence_scale=SAMPLE_EVIDENCE_SCALE,
+                step_size=SAMPLE_STEP_SIZE,
             )
             show_tensor_grid(
                 image_trace[-1],
@@ -387,44 +396,60 @@ def run_aspect_ratio_grid(model, conditioner, device):
             )
 
 
-# EXPERIMENT 3: T-SCRAPE LOSS CURVE ====================================================================================
+# EXPERIMENT 3: ALPHA SCRAPE LOSS CURVE ================================================================================
 
 @torch.no_grad()
-def run_t_scrape_loss(model, conditioner, device):
-    dataset = MNISTImages(train=False, image_size=T_SCRAPE_IMAGE_SIZE)
-    dataloader = DataLoader(dataset, batch_size=T_SCRAPE_BATCH_SIZE, shuffle=True, num_workers=0)
-    t_values = torch.linspace(0.0, 1.0, steps=T_SCRAPE_POINTS, device=device)
+def run_alpha_scrape_loss(model, conditioner, device):
+    dataset = MNISTImages(train=False, image_size=ALPHA_SCRAPE_IMAGE_SIZE)
+    dataloader = DataLoader(dataset, batch_size=ALPHA_SCRAPE_BATCH_SIZE, shuffle=True, num_workers=0)
+    alpha_values = torch.linspace(0.0, 1.0, steps=ALPHA_SCRAPE_POINTS, device=device)
     losses = []
 
     model.eval()
     conditioner.eval()
-    for t_value in tqdm(t_values, total=len(t_values), desc="t scrape"):
+    for alpha_value in tqdm(
+            alpha_values,
+            total=len(alpha_values),
+            desc="alpha scrape",
+    ):
         total_loss = 0.0
         batches = 0
         for images, labels in dataloader:
-            if batches >= T_SCRAPE_MAX_BATCHES:
+            if batches >= ALPHA_SCRAPE_MAX_BATCHES:
                 break
             images = images.to(device).clamp(0.0, 1.0)
             labels = labels.to(device, dtype=torch.long)
-            t_batch = torch.full((images.shape[0],), float(t_value.item()), device=device)
-            model_input, target_velocity, _ = velocity_training_pair(images, t_batch)
+            alpha_batch = torch.full((images.shape[0],), float(alpha_value.item()), device=device)
+            model_input, target_velocity, _, alpha_map = rift_training_pair(
+                images,
+                alpha=alpha_batch,
+            )
             model_time = torch.zeros(images.shape[0], device=device)
-            predicted_velocity = model(model_input, model_time, [conditioner(labels)])[0]
-            total_loss += nn.functional.mse_loss(predicted_velocity, target_velocity).item()
+            predicted_velocity = model(
+                model_input,
+                model_time,
+                [(conditioner(labels), LABEL_EVIDENCE_STRENGTH)],
+                evidence_scale=SAMPLE_EVIDENCE_SCALE,
+            )[0]
+            total_loss += weighted_velocity_mse_loss(predicted_velocity, target_velocity, alpha_map).item()
             batches += 1
         losses.append(total_loss / max(1, batches))
 
-    show_t_loss_curve(t_values, losses)
+    show_alpha_loss_curve(alpha_values, losses)
     best_idx = min(range(len(losses)), key=lambda idx: losses[idx])
     worst_idx = max(range(len(losses)), key=lambda idx: losses[idx])
-    print(f"Best t={float(t_values[best_idx].item()):.4f} loss={losses[best_idx]:.6f}")
-    print(f"Worst t={float(t_values[worst_idx].item()):.4f} loss={losses[worst_idx]:.6f}")
+    print(f"Best alpha={float(alpha_values[best_idx].item()):.4f} loss={losses[best_idx]:.6f}")
+    print(f"Worst alpha={float(alpha_values[worst_idx].item()):.4f} loss={losses[worst_idx]:.6f}")
 
 
 # EXPERIMENT 4: CLEAN-IMAGE START ======================================================================================
 
 def run_clean_start_trajectory(model, conditioner, device):
     clean_images, source_labels = clean_digit_batch(image_size=28, device=device)
+    clean_start_noise = sample_noise(clean_images.shape, device=device)
+    clean_start_images = (
+            (1.0 - CLEAN_START_ALPHA) * clean_images + CLEAN_START_ALPHA * clean_start_noise
+    ).clamp(0.0, 1.0)
 
     for shift in range(10):
         target_labels = (source_labels + shift) % 10
@@ -434,31 +459,35 @@ def run_clean_start_trajectory(model, conditioner, device):
             labels=target_labels,
             height=28,
             width=28,
-            steps=CLEAN_START_STEPS,
+            num_steps=CLEAN_START_NUM_STEPS,
             device=device,
-            forced_t=None,
-            cfg_scale=CFG_SCALE,
-            initial_x=clean_images,
-            schedule_scale=CLEAN_START_SCHEDULE_SCALE,
+            label_strength=LABEL_EVIDENCE_STRENGTH,
+            evidence_scale=CLEAN_START_EVIDENCE_SCALE,
+            initial_x=clean_start_images,
+            step_size=CLEAN_START_STEP_SIZE,
+            invert_steps=CLEAN_START_INVERT_STEPS,
         )
         column_titles = source_to_target_titles(source_labels, target_labels)
         show_trace_grid(
             image_trace,
             title=(
                 f"28x28 clean-start overwrite trajectory | target = source + {shift} mod 10 | "
-                f"steps={CLEAN_START_STEPS}, schedule_scale={CLEAN_START_SCHEDULE_SCALE:g}"
+                f"num_steps={CLEAN_START_NUM_STEPS}, step_size={CLEAN_START_STEP_SIZE:g}, "
+                f"invert_steps={CLEAN_START_INVERT_STEPS}, evidence_scale={CLEAN_START_EVIDENCE_SCALE:g}, "
+                f"start_alpha={CLEAN_START_ALPHA:g}"
             ),
             name=f"clean_start_shift_{shift}_image_trace",
             labels=target_labels.cpu(),
             column_titles=column_titles,
         )
-        if CLEAN_START_SHOW_VELOCITY:
+        if CLEAN_START_SHOW_MODEL_OUTPUTS:
             show_trace_grid(
                 velocity_trace,
-                title=f"28x28 clean-start overwrite velocity | target = source + {shift} mod 10",
-                name=f"clean_start_shift_{shift}_velocity_trace",
+                title=f"28x28 clean-start predicted residual velocity | target = source + {shift} mod 10",
+                name=f"clean_start_shift_{shift}_predicted_velocity_trace",
                 labels=target_labels.cpu(),
-                map_velocity=True,
+                value_range=(-1.0, 1.0),
+                map_signed=True,
                 column_titles=column_titles,
             )
 
@@ -474,8 +503,8 @@ def main() -> None:
         run_square_resolution_trajectories(model, conditioner, device)
     if RUN_ASPECT_RATIO_GRID:
         run_aspect_ratio_grid(model, conditioner, device)
-    if RUN_T_SCRAPE_LOSS:
-        run_t_scrape_loss(model, conditioner, device)
+    if RUN_ALPHA_SCRAPE_LOSS:
+        run_alpha_scrape_loss(model, conditioner, device)
     if RUN_CLEAN_START_TRAJECTORY:
         run_clean_start_trajectory(model, conditioner, device)
 
