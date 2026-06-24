@@ -208,6 +208,7 @@ class ImageFFN(nn.Module):
         self.activation = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
         self.compress = nn.Conv2d(hidden_channels, d_channels, 1)
+        self.adaptive_enabled = True
 
         nn.init.zeros_(self.to_gamma.weight)
         nn.init.zeros_(self.to_gamma.bias)
@@ -218,7 +219,7 @@ class ImageFFN(nn.Module):
         expanded = self.expand(x)
         gamma = self.to_gamma(x)
         beta = self.to_beta(x)
-        adapted = expanded * (1.0 + gamma) + beta
+        adapted = expanded * (1.0 + gamma) + beta if self.adaptive_enabled else expanded
         return self.compress(self.dropout(self.activation(adapted)))
 
 
