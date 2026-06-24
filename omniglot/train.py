@@ -20,54 +20,57 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from modules.conditioning import ClassLabelConditioner
-from modules.rift import RIFT
 from modules.render_image import render_image
-from modules.sampling import run_velocity_sampling
-from modules.velocity import sample_noise, velocity_training_pair
-
+from modules.rift import RIFT
+from modules.rift_diffusion import rift_training_pair, sample_noise, velocity_mse_loss
+from modules.sampling import run_rift_sampling
 
 # CONFIG ===============================================================================================================
 
 DATASET_NAME = "Omniglot"
-DATA_ROOT = "data"
-OUTPUT_DIR = "models"
+DATA_ROOT = PROJECT_ROOT / "data"
+MODEL_DIR = Path(__file__).resolve().parent / "models"
+OUTPUT_DIR = MODEL_DIR
 DEVICE = "cuda"
 SEED = 0
 
-IMAGE_SIZE = 32
+IMAGE_SIZE = 28
 IMAGE_CHANNELS = 1
 
-D_CHANNELS = 192
-NUM_HEADS = 6
-BLOCK_COUNT = 8
-POS_FREQ = 16
-TIME_FREQ = 10
-TOKEN_COUNT = 2
+D_CHANNELS = 512
+NUM_HEADS = 8
+BLOCK_COUNT = 4
+POS_FREQ = 5
+TIME_FREQ = 5
+TOKEN_COUNT = 1
 
 SELF_ATTN_DROPOUT = 0.0
 CROSS_ATTN_DROPOUT = 0.0
 FFN_DROPOUT = 0.0
 
-EPOCHS = 40
-BATCH_SIZE = 32
-EVAL_BATCH_SIZE = 8
+EPOCHS = 20
+BATCH_SIZE = 20
+EVAL_BATCH_SIZE = 4
 NUM_WORKERS = 2
-LR = 1e-3
+LR = 1e-4
 LR_END = 1e-6
 EMA_DECAY = 0.999
-CONDITION_DROPOUT = 0.2
+VELOCITY_LOSS_WEIGHT = 1.0
+GRAD_CLIP_NORM = 1.0
 
-TEST_SIZES = (32, 64, 128)
-T_LOSS_VALUES = (0.01, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99)
-SAMPLE_SIZES = (32, 64, 128)
-SAMPLE_STEPS = 100
-SAMPLE_STEP_SIZE = 1.0
-SAMPLE_COUNT = 100
-CONDITION_STRENGTH = 1.0
-EVIDENCE_SCALE = 1.0
+TRAIN_FRACTION_PER_GLYPH = 0.8
+SPLIT_SEED = 0
+
+TEST_SIZES = (28,)
+ALPHA_LOSS_VALUES = (0.00, 0.10, 0.25, 0.50, 0.75, 0.90, 1.00)
+SAMPLE_SIZES = ((14, 14), (28, 28), (64, 64), (128, 128))
+SAMPLE_STEP_SIZE = 0.05
+SAMPLE_STEPS = 20
+SAMPLE_COUNT = 10
+CFG_SCALE = 4.0
 
 SAMPLE_EVERY = 1
-SAVE_EVERY = 0
+SAVE_EVERY = 1
 PLOT_EVERY = 1
 MAX_TRAIN_BATCHES = None
 MAX_TEST_BATCHES = None
@@ -76,28 +79,64 @@ MAX_TEST_BATCHES = None
 # DATA =================================================================================================================
 
 class OmniglotImages(torch.utils.data.Dataset):
-    def __init__(self, background: bool):
-        self.dataset = datasets.Omniglot(
-            root=DATA_ROOT,
-            background=background,
+    def __init__(self, split: str, image_size: int = IMAGE_SIZE):
+        if split not in {"train", "test"}:
+            raise ValueError(f"split must be 'train' or 'test', got {split!r}")
+
+        transform = transforms.Compose([
+            transforms.Resize(
+                (image_size, image_size),
+                interpolation=transforms.InterpolationMode.BICUBIC,
+                antialias=True,
+            ),
+            transforms.ToTensor(),
+        ])
+        background_dataset = datasets.Omniglot(
+            root=str(DATA_ROOT),
+            background=True,
             download=True,
-            transform=transforms.Compose([
-                transforms.Resize(
-                    (IMAGE_SIZE, IMAGE_SIZE),
-                    interpolation=transforms.InterpolationMode.BICUBIC,
-                    antialias=True,
-                ),
-                transforms.ToTensor(),
-            ]),
+            transform=transform,
         )
-        self.num_classes = len(self.dataset._characters)
+        evaluation_dataset = datasets.Omniglot(
+            root=str(DATA_ROOT),
+            background=False,
+            download=True,
+            transform=transform,
+        )
+
+        self.sources = [background_dataset, evaluation_dataset]
+        self.source_class_offsets = [0, len(background_dataset._characters)]
+        self.num_classes = len(background_dataset._characters) + len(evaluation_dataset._characters)
+        self.samples = self._make_split_samples(split)
+        self.split = split
 
     def __getitem__(self, index: int):
-        image, label = self.dataset[index]
-        return image, torch.tensor(label, dtype=torch.long)
+        source_index, local_index, global_label = self.samples[index]
+        image, _ = self.sources[source_index][local_index]
+        return image, torch.tensor(global_label, dtype=torch.long)
 
     def __len__(self) -> int:
-        return len(self.dataset)
+        return len(self.samples)
+
+    def _make_split_samples(self, split: str) -> list[tuple[int, int, int]]:
+        samples = []
+        for source_index, source_dataset in enumerate(self.sources):
+            class_offset = self.source_class_offsets[source_index]
+            indices_by_label: dict[int, list[int]] = {}
+            for local_index, (_, local_label) in enumerate(source_dataset._flat_character_images):
+                indices_by_label.setdefault(int(local_label), []).append(local_index)
+
+            for local_label, local_indices in sorted(indices_by_label.items()):
+                global_label = class_offset + local_label
+                indices = list(local_indices)
+                rng = random.Random(SPLIT_SEED + global_label)
+                rng.shuffle(indices)
+                train_count = int(round(len(indices) * TRAIN_FRACTION_PER_GLYPH))
+                if len(indices) > 1:
+                    train_count = min(max(1, train_count), len(indices) - 1)
+                selected = indices[:train_count] if split == "train" else indices[train_count:]
+                samples.extend((source_index, local_index, global_label) for local_index in selected)
+        return samples
 
 
 # SMALL HELPERS ========================================================================================================
@@ -123,16 +162,17 @@ def format_parameters(num_params: int) -> str:
     return f"{num_params:,}"
 
 
-def resize_image(image: torch.Tensor, size: int) -> torch.Tensor:
-    if image.shape[-2:] == (size, size):
+def resize_image(image: torch.Tensor, height: int, width: int | None = None) -> torch.Tensor:
+    width = height if width is None else width
+    if image.shape[-2:] == (height, width):
         return image
     return torch.nn.functional.interpolate(
         image,
-        size=(size, size),
+        size=(height, width),
         mode="bicubic",
         align_corners=False,
         antialias=True,
-    )
+    ).clamp(0.0, 1.0)
 
 
 def make_cosine_with_warmup(optimizer: torch.optim.Optimizer, warmup_steps: int, total_steps: int):
@@ -159,20 +199,16 @@ def update_ema(source: nn.Module, target: nn.Module) -> None:
         ema_param.data.mul_(EMA_DECAY).add_(param.data, alpha=1.0 - EMA_DECAY)
 
 
-def make_training_strengths(labels: torch.Tensor) -> torch.Tensor:
-    strengths = torch.ones(labels.shape, device=labels.device)
-    if CONDITION_DROPOUT <= 0.0:
-        return strengths
-    dropped = torch.rand(labels.shape, device=labels.device) < CONDITION_DROPOUT
-    return torch.where(dropped, torch.zeros_like(strengths), strengths)
-
-
 def label_grid(num_classes: int, count: int, device: torch.device) -> torch.Tensor:
     labels = torch.arange(min(num_classes, count), dtype=torch.long, device=device)
     if labels.numel() >= count:
         return labels[:count]
     repeats = (count + labels.numel() - 1) // labels.numel()
     return labels.repeat(repeats)[:count]
+
+
+def null_labels_like(labels: torch.Tensor, num_classes: int) -> torch.Tensor:
+    return torch.full_like(labels, fill_value=num_classes)
 
 
 # MODEL / LOSS =========================================================================================================
@@ -188,6 +224,7 @@ def build_model(device: torch.device) -> RIFT:
         self_attn_dropout=SELF_ATTN_DROPOUT,
         cross_attn_dropout=CROSS_ATTN_DROPOUT,
         ffn_dropout=FFN_DROPOUT,
+        linear_attention=True,
     ).to(device)
 
 
@@ -195,20 +232,35 @@ def build_conditioner(device: torch.device, num_classes: int) -> ClassLabelCondi
     return ClassLabelConditioner(num_classes, TOKEN_COUNT, D_CHANNELS).to(device)
 
 
-def velocity_prediction_loss(model: RIFT, conditioner: ClassLabelConditioner, image: torch.Tensor, labels: torch.Tensor):
-    image = image.clamp(0.0, 1.0)
-    model_input, target_velocity, _ = velocity_training_pair(image)
-    model_time = torch.zeros(image.shape[0], device=image.device)
-    condition_tokens = conditioner(labels)
-    condition_strengths = make_training_strengths(labels)
-    predicted_velocity = model(model_input, model_time, [(condition_tokens, condition_strengths)])[0]
-    return nn.functional.mse_loss(predicted_velocity, target_velocity)
+def rift_prediction_loss(
+        model: RIFT,
+        conditioner: ClassLabelConditioner,
+        image: torch.Tensor,
+        labels: torch.Tensor,
+        num_classes: int,
+):
+    model_input, target_velocity, _, alpha = rift_training_pair(image)
+    model_time = 1.0 - alpha
+
+    positive_tokens = conditioner(labels)
+    negative_tokens = conditioner(null_labels_like(labels, num_classes))
+    predicted_null, predicted_pos = model(model_input, model_time, [negative_tokens, positive_tokens])
+
+    null_loss = velocity_mse_loss(predicted_null, target_velocity)
+    pos_loss = velocity_mse_loss(predicted_pos, target_velocity)
+    return VELOCITY_LOSS_WEIGHT * 0.5 * (null_loss + pos_loss)
 
 
 # EVAL / SAMPLING ======================================================================================================
 
 @torch.no_grad()
-def evaluate(model: RIFT, conditioner: ClassLabelConditioner, dataloader: DataLoader, device: torch.device):
+def evaluate(
+        model: RIFT,
+        conditioner: ClassLabelConditioner,
+        dataloader: DataLoader,
+        device: torch.device,
+        num_classes: int,
+):
     model.eval()
     conditioner.eval()
     losses_by_size = {}
@@ -216,18 +268,23 @@ def evaluate(model: RIFT, conditioner: ClassLabelConditioner, dataloader: DataLo
     for size in TEST_SIZES:
         total_loss = 0.0
         batches = 0
-        for image, labels in tqdm(dataloader, total=len(dataloader), desc=f"test {size}px", leave=False):
+        for image, labels in tqdm(dataloader, total=len(dataloader), desc=f"test pixel {size}px", leave=False):
             if MAX_TEST_BATCHES is not None and batches >= MAX_TEST_BATCHES:
                 break
-            image = image[:EVAL_BATCH_SIZE]
-            labels = labels[:EVAL_BATCH_SIZE]
-            image = resize_image(image, size).to(device).clamp(0.0, 1.0)
-            labels = labels.to(device, dtype=torch.long)
+            image = image[:EVAL_BATCH_SIZE].to(device).clamp(0.0, 1.0)
+            labels = labels[:EVAL_BATCH_SIZE].to(device, dtype=torch.long)
+            image = resize_image(image, size)
+            model_input, target_velocity, _, alpha = rift_training_pair(image)
+            model_time = 1.0 - alpha
 
-            model_input, target_velocity, _ = velocity_training_pair(image)
-            model_time = torch.zeros(image.shape[0], device=device)
-            predicted_velocity = model(model_input, model_time, [(conditioner(labels), CONDITION_STRENGTH)])[0]
-            total_loss += nn.functional.mse_loss(predicted_velocity, target_velocity).item()
+            positive_tokens = conditioner(labels)
+            negative_tokens = conditioner(null_labels_like(labels, num_classes))
+            predicted_null, predicted_pos = model(model_input, model_time, [negative_tokens, positive_tokens])
+            loss = 0.5 * (
+                    velocity_mse_loss(predicted_null, target_velocity)
+                    + velocity_mse_loss(predicted_pos, target_velocity)
+            )
+            total_loss += (VELOCITY_LOSS_WEIGHT * loss).item()
             batches += 1
 
         losses_by_size[size] = total_loss / max(1, batches)
@@ -236,7 +293,13 @@ def evaluate(model: RIFT, conditioner: ClassLabelConditioner, dataloader: DataLo
 
 
 @torch.no_grad()
-def evaluate_by_time(model: RIFT, conditioner: ClassLabelConditioner, dataloader: DataLoader, device: torch.device):
+def evaluate_by_alpha(
+        model: RIFT,
+        conditioner: ClassLabelConditioner,
+        dataloader: DataLoader,
+        device: torch.device,
+        num_classes: int,
+):
     model.eval()
     conditioner.eval()
     image, labels = next(iter(dataloader))
@@ -244,34 +307,82 @@ def evaluate_by_time(model: RIFT, conditioner: ClassLabelConditioner, dataloader
     labels = labels[:EVAL_BATCH_SIZE].to(device, dtype=torch.long)
 
     losses = []
-    for value in T_LOSS_VALUES:
-        uniform_t = torch.full((image.shape[0],), float(value), device=device)
-        model_input, target_velocity, _ = velocity_training_pair(image, uniform_t)
-        model_time = torch.zeros(image.shape[0], device=device)
-        predicted_velocity = model(model_input, model_time, [(conditioner(labels), CONDITION_STRENGTH)])[0]
-        losses.append(nn.functional.mse_loss(predicted_velocity, target_velocity).item())
+    for value in ALPHA_LOSS_VALUES:
+        alpha = torch.full((image.shape[0],), float(value), device=device)
+        model_input, target_velocity, _, alpha = rift_training_pair(image, alpha=alpha)
+        model_time = 1.0 - alpha
+        positive_tokens = conditioner(labels)
+        negative_tokens = conditioner(null_labels_like(labels, num_classes))
+        predicted_null, predicted_pos = model(model_input, model_time, [negative_tokens, positive_tokens])
+        loss = 0.5 * (
+                velocity_mse_loss(predicted_null, target_velocity)
+                + velocity_mse_loss(predicted_pos, target_velocity)
+        )
+        losses.append((VELOCITY_LOSS_WEIGHT * loss).item())
     return losses
 
 
 @torch.no_grad()
-def render_samples(model: RIFT, conditioner: ClassLabelConditioner, epoch: int, device: torch.device, num_classes: int) -> None:
+def velocity_diagnostics(
+        model: RIFT,
+        conditioner: ClassLabelConditioner,
+        dataloader: DataLoader,
+        device: torch.device,
+        num_classes: int,
+) -> dict[str, float]:
+    model.eval()
+    conditioner.eval()
+    image, labels = next(iter(dataloader))
+    image = image[:EVAL_BATCH_SIZE].to(device).clamp(0.0, 1.0)
+    labels = labels[:EVAL_BATCH_SIZE].to(device, dtype=torch.long)
+    model_input, target_velocity, _, alpha = rift_training_pair(image)
+    model_time = 1.0 - alpha
+    positive_tokens = conditioner(labels)
+    negative_tokens = conditioner(null_labels_like(labels, num_classes))
+    predicted_null, predicted_pos = model(model_input, model_time, [negative_tokens, positive_tokens])
+
+    return {
+        "zero_mse": target_velocity.square().mean().item(),
+        "pos_mse": velocity_mse_loss(predicted_pos, target_velocity).item(),
+        "null_mse": velocity_mse_loss(predicted_null, target_velocity).item(),
+        "target_std": target_velocity.std().item(),
+        "pos_std": predicted_pos.std().item(),
+        "pos_saturation": (predicted_pos.abs() > 0.95).float().mean().item(),
+        "image_mean": image.mean().item(),
+        "image_std": image.std().item(),
+    }
+
+
+@torch.no_grad()
+def render_samples(
+        model: RIFT,
+        conditioner: ClassLabelConditioner,
+        epoch: int,
+        device: torch.device,
+        num_classes: int,
+) -> None:
     model.eval()
     conditioner.eval()
     labels = label_grid(num_classes, SAMPLE_COUNT, device)
-    text_conditions = [(conditioner(labels), CONDITION_STRENGTH)]
+    positive_tokens = conditioner(labels)
+    negative_tokens = conditioner(null_labels_like(labels, num_classes))
 
-    for size in SAMPLE_SIZES:
-        initial_noise = sample_noise((labels.shape[0], IMAGE_CHANNELS, size, size), device=device)
-        samples, _ = run_velocity_sampling(
-            model=model,
-            initial_noise=initial_noise,
-            text_conditions=text_conditions,
-            num_steps=SAMPLE_STEPS,
-            step_size=SAMPLE_STEP_SIZE,
-            evidence_scale=EVIDENCE_SCALE,
+    for height, width in SAMPLE_SIZES:
+        initial_noise = sample_noise(
+            (labels.shape[0], IMAGE_CHANNELS, height, width),
             device=device,
         )
-        render_image(samples, title=f"Omniglot R2ID | E{epoch + 1} | {size}px")
+        samples, _ = run_rift_sampling(
+            model=model,
+            initial_noise=initial_noise,
+            positive_text_conditioning=positive_tokens,
+            negative_text_conditioning=negative_tokens,
+            num_steps=SAMPLE_STEPS,
+            step_size=SAMPLE_STEP_SIZE,
+            cfg_scale=CFG_SCALE,
+            device=device,
+        )
+        render_image(samples, title=f"Omniglot pixel RIFT | E{epoch + 1} | {height}x{width}")
 
 
 # SAVE / PLOT ==========================================================================================================
@@ -280,6 +391,12 @@ def checkpoint_config(num_classes: int) -> dict:
     return {
         "dataset": DATASET_NAME,
         "image_size": IMAGE_SIZE,
+        "data_split": {
+            "source": "torchvision Omniglot background + evaluation pooled into one glyph vocabulary",
+            "train_fraction_per_glyph": TRAIN_FRACTION_PER_GLYPH,
+            "split_seed": SPLIT_SEED,
+            "note": "Omniglot has 20 examples per glyph, so this is usually 16 train / 4 test.",
+        },
         "model": {
             "image_channels": IMAGE_CHANNELS,
             "num_classes": num_classes,
@@ -289,29 +406,41 @@ def checkpoint_config(num_classes: int) -> dict:
             "pos_freq": POS_FREQ,
             "time_freq": TIME_FREQ,
             "token_count": TOKEN_COUNT,
-            "time_conditioning": False,
-            "velocity_target": "clean_image - corrupted_image",
-            "model_input": "where(pixel_rand >= t_threshold, noise, clean_image)",
-            "mask_sampling": "t_threshold = per_image_rand when random; fixed t is used as the threshold",
-            "t_definition": "t=0 noise, t=1 clean",
-            "conditioning": "evidence accumulation with per-condition strengths and per-pixel AdaLN",
-            "condition_dropout": CONDITION_DROPOUT,
-            "evidence_scale": EVIDENCE_SCALE,
+            "linear_attention": True,
+            "input_projection": "separate 1x1 color projection + 1x1 position projection, then add",
+            "ffn": "D->4D adaptive per-pixel gamma/beta modulation, SiLU, 4D->D",
+            "time_conditioning": True,
+            "prediction_target": "velocity = x1_clean_pixel - x0_noise",
+            "model_input": "x_t = (1 - alpha) * x1_clean_pixel + alpha * x0_noise",
+            "x0_sampling": "x0_noise = torch.rand_like(clean_pixel_image)",
+            "alpha_sampling": "per-image alpha U(0, 1)",
+            "time": "t = 1 - alpha",
+            "loss": "unweighted MSE on null and positive CFG branches",
+            "sampler": "x_next = clamp(x + step_size * predicted_velocity)",
+            "conditioning": "standard cross attention with classifier-free guidance at sampling time",
+            "cfg_scale": CFG_SCALE,
+            "sample_steps": SAMPLE_STEPS,
+            "sample_step_size": SAMPLE_STEP_SIZE,
         },
     }
 
 
-def save_checkpoint(model: RIFT, conditioner: ClassLabelConditioner, epoch: int, test_loss: float, num_classes: int) -> None:
-    folder = Path(OUTPUT_DIR)
-    folder.mkdir(parents=True, exist_ok=True)
+def save_checkpoint(
+        model: RIFT,
+        conditioner: ClassLabelConditioner,
+        epoch: int,
+        test_loss: float,
+        num_classes: int,
+) -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     stem = f"Omniglot_E{epoch + 1:03d}_{test_loss:.5f}_{timestamp}"
 
-    save_file(model.state_dict(), str(folder / f"{stem}_r2id.safetensors"))
-    save_file(conditioner.state_dict(), str(folder / f"{stem}_conditioner.safetensors"))
-    with open(folder / f"{stem}_config.json", "w", encoding="utf-8") as handle:
+    save_file(model.state_dict(), str(OUTPUT_DIR / f"{stem}_rift.safetensors"))
+    save_file(conditioner.state_dict(), str(OUTPUT_DIR / f"{stem}_conditioner.safetensors"))
+    with open(OUTPUT_DIR / f"{stem}_config.json", "w", encoding="utf-8") as handle:
         json.dump(checkpoint_config(num_classes), handle, indent=2)
-    print(f"Saved checkpoint stem: {folder / stem}")
+    print(f"Saved checkpoint stem: {OUTPUT_DIR / stem}")
 
 
 def plot_history(history: dict, epoch: int) -> None:
@@ -319,7 +448,7 @@ def plot_history(history: dict, epoch: int) -> None:
         return
 
     plt.figure()
-    plt.title("Omniglot R2ID Velocity Loss")
+    plt.title("Omniglot Pixel RIFT Flow Velocity Loss")
     plt.plot(history["train"], label="train")
     plt.plot(history["test"], label="test avg")
     plt.legend()
@@ -327,7 +456,7 @@ def plot_history(history: dict, epoch: int) -> None:
     plt.show()
 
     plt.figure()
-    plt.title("Omniglot R2ID Test Loss by Resolution")
+    plt.title("Omniglot Pixel RIFT Test Loss by Resolution")
     for size, values in history["test_by_size"].items():
         plt.plot(values, label=f"{size}px")
     plt.legend()
@@ -335,10 +464,10 @@ def plot_history(history: dict, epoch: int) -> None:
     plt.show()
 
     plt.figure()
-    plt.title("Omniglot R2ID Loss by Uniform t")
-    t_history = torch.tensor(history["t_losses"])
-    for idx, value in enumerate(T_LOSS_VALUES):
-        plt.plot(t_history[:, idx].tolist(), label=f"t={value:.2f}")
+    plt.title("Omniglot Pixel RIFT Loss by Fixed Alpha")
+    alpha_history = torch.tensor(history["alpha_losses"])
+    for idx, value in enumerate(ALPHA_LOSS_VALUES):
+        plt.plot(alpha_history[:, idx].tolist(), label=f"alpha={value:.2f}")
     plt.legend()
     plt.tight_layout()
     plt.show()
@@ -352,15 +481,18 @@ def main() -> None:
 
     set_seed(SEED)
     device = torch.device(DEVICE if DEVICE != "cuda" or torch.cuda.is_available() else "cpu")
-    train_dataset = OmniglotImages(background=True)
-    test_dataset = OmniglotImages(background=False)
+    train_dataset = OmniglotImages(split="train")
+    test_dataset = OmniglotImages(split="test")
     num_classes = train_dataset.num_classes
+    if test_dataset.num_classes != num_classes:
+        raise ValueError(f"Train/test class mismatch: {num_classes} vs {test_dataset.num_classes}")
 
     print(f"Device: {device}")
-    print(
-        f"Omniglot R2ID: image={IMAGE_SIZE}px, classes={num_classes}, d={D_CHANNELS}, "
-        f"heads={NUM_HEADS}, blocks={BLOCK_COUNT}, pos_freq={POS_FREQ}, time_freq={TIME_FREQ}"
-    )
+    print(f"Omniglot pixel RIFT: image={IMAGE_SIZE}px, classes={num_classes}, tokens={TOKEN_COUNT}, "
+          f"d={D_CHANNELS}, heads={NUM_HEADS}, blocks={BLOCK_COUNT}, "
+          f"pos_freq={POS_FREQ}, time_freq={TIME_FREQ}")
+    print(f"Omniglot split: train={len(train_dataset)} images, test={len(test_dataset)} images, "
+          f"train_fraction_per_glyph={TRAIN_FRACTION_PER_GLYPH:.2f}")
 
     train_loader = DataLoader(
         train_dataset,
@@ -383,18 +515,19 @@ def main() -> None:
         param.requires_grad = False
 
     conditioner = build_conditioner(device, num_classes)
-    print(f"R2ID parameters: {format_parameters(count_parameters(model))}")
+    print(f"RIFT parameters: {format_parameters(count_parameters(model))}")
     print(f"Conditioner parameters: {format_parameters(count_parameters(conditioner))}")
     model.print_model_summary()
 
-    optimizer = torch.optim.AdamW(list(model.parameters()) + list(conditioner.parameters()), lr=LR)
+    trainable_parameters = list(model.parameters()) + list(conditioner.parameters())
+    optimizer = torch.optim.AdamW(trainable_parameters, lr=LR)
     scheduler = make_cosine_with_warmup(optimizer, len(train_loader), EPOCHS * len(train_loader))
 
     history = {
         "train": [],
         "test": [],
         "test_by_size": {size: [] for size in TEST_SIZES},
-        "t_losses": [],
+        "alpha_losses": [],
     }
     start = time.time()
 
@@ -410,9 +543,10 @@ def main() -> None:
 
             image = image.to(device).clamp(0.0, 1.0)
             labels = labels.to(device, dtype=torch.long)
-            loss = velocity_prediction_loss(model, conditioner, image, labels)
+            loss = rift_prediction_loss(model, conditioner, image, labels, num_classes)
 
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable_parameters, GRAD_CLIP_NORM)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
@@ -422,19 +556,30 @@ def main() -> None:
             train_batches += 1
 
         train_loss = total_train_loss / max(1, train_batches)
-        test_by_size = evaluate(ema_model, conditioner, test_loader, device)
+        test_by_size = evaluate(ema_model, conditioner, test_loader, device, num_classes)
         test_loss = sum(test_by_size.values()) / max(1, len(test_by_size))
-        t_losses = evaluate_by_time(ema_model, conditioner, test_loader, device)
+        alpha_losses = evaluate_by_alpha(ema_model, conditioner, test_loader, device, num_classes)
+        diagnostics = velocity_diagnostics(ema_model, conditioner, test_loader, device, num_classes)
 
         history["train"].append(train_loss)
         history["test"].append(test_loss)
-        history["t_losses"].append(t_losses)
+        history["alpha_losses"].append(alpha_losses)
         for size, loss_value in test_by_size.items():
             history["test_by_size"][size].append(loss_value)
 
         print(f"Epoch {epoch + 1} | TRAIN: {train_loss:.5f} | TEST: {test_loss:.5f}")
         print("Test by size:", " | ".join(f"{size}px: {loss:.5f}" for size, loss in test_by_size.items()))
-        print("T-losses:", " | ".join(f"t={t:.2f}: {loss:.5f}" for t, loss in zip(T_LOSS_VALUES, t_losses)))
+        print("Alpha losses:", " | ".join(
+            f"alpha={alpha:.2f}: {loss:.5f}"
+            for alpha, loss in zip(ALPHA_LOSS_VALUES, alpha_losses)
+        ))
+        print(
+            "Velocity diagnostics:",
+            " | ".join(
+                f"{key}: {value:.5f}"
+                for key, value in diagnostics.items()
+            ),
+        )
 
         plot_history(history, epoch)
 
