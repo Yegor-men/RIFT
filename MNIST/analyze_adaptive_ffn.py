@@ -34,9 +34,15 @@ IMAGE_CHANNELS = 3
 ANALYSIS_SIZES = (14, 28, 64, 128)
 ALPHA = 0.5
 CFG_SCALE_FOR_DELTA = 4.0
-FINAL_BLOCK_MAP_SIZE = 28
+FINAL_BLOCK_MAP_SIZE = 64
 FINAL_BLOCK_MAP_COUNT = 8
 RENDER_FINAL_BLOCK_MAPS = True
+RENDER_RMS_FINAL_BLOCK_MAPS = True
+RENDER_SIGNED_FINAL_BLOCK_MAPS = True
+RENDER_COHERENCE_FINAL_BLOCK_MAPS = True
+SIGNED_MAP_QUANTILE = 0.99
+SIGNED_MAP_CMAP = "bwr"
+COHERENCE_MAP_CMAP = "magma"
 SAVE_FIGURES = False
 FIGURE_DIR = Path("MNIST/media/adaptive_ffn")
 
@@ -120,6 +126,16 @@ def relative_rms_delta(a: torch.Tensor, b: torch.Tensor) -> float:
     if denominator <= 1e-12:
         return 0.0
     return rms(a - b).item() / denominator
+
+
+def channel_sign_coherence(tensor: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    channel_mean = tensor.mean(dim=1, keepdim=True)
+    channel_rms = tensor.square().mean(dim=1, keepdim=True).sqrt()
+    return (channel_mean.abs() / channel_rms.clamp_min(eps)).clamp(0.0, 1.0)
+
+
+def mean_channel_sign_coherence(tensor: torch.Tensor) -> float:
+    return channel_sign_coherence(tensor).mean().item()
 
 
 def mean_or_nan(values: list[float]) -> float:
@@ -212,12 +228,15 @@ def stat_row(name: str, branch: str, expanded: torch.Tensor, gamma: torch.Tensor
         "gamma_abs": gamma.abs().mean().item(),
         "gamma_rms": rms(gamma).item(),
         "gamma_spatial_frac": spatial_fraction(gamma),
+        "gamma_sign_coherence": mean_channel_sign_coherence(gamma),
         "beta_abs": beta.abs().mean().item(),
         "beta_rms": rms(beta).item(),
         "beta_spatial_frac": spatial_fraction(beta),
+        "beta_sign_coherence": mean_channel_sign_coherence(beta),
         "delta_rms": delta_rms,
         "delta_to_expanded": delta_rms / max(expanded_rms, 1e-12),
         "delta_spatial_frac": spatial_fraction(delta),
+        "delta_sign_coherence": mean_channel_sign_coherence(delta),
     }
 
 
@@ -266,12 +285,15 @@ def aggregate_stats(rows: list[dict[str, float | str]]) -> dict[str, float]:
         "gamma_abs",
         "gamma_rms",
         "gamma_spatial_frac",
+        "gamma_sign_coherence",
         "beta_abs",
         "beta_rms",
         "beta_spatial_frac",
+        "beta_sign_coherence",
         "delta_rms",
         "delta_to_expanded",
         "delta_spatial_frac",
+        "delta_sign_coherence",
     ]
     return {key: mean_or_nan([float(row[key]) for row in rows]) for key in keys}
 
@@ -324,6 +346,15 @@ def print_decomposition(prefix: str, tensor: torch.Tensor) -> None:
     )
 
 
+def print_sign_coherence(prefix: str, record: dict[str, torch.Tensor]) -> None:
+    print(
+        f"    {prefix}: "
+        f"gamma={mean_channel_sign_coherence(record['gamma']):.3f}, "
+        f"beta={mean_channel_sign_coherence(record['beta']):.3f}, "
+        f"delta={mean_channel_sign_coherence(record['delta']):.3f}"
+    )
+
+
 def print_final_block_report(
         size: int,
         true_records: dict[str, dict[str, torch.Tensor]],
@@ -337,11 +368,13 @@ def print_final_block_report(
         print_decomposition("gamma", true_records[branch]["gamma"])
         print_decomposition("beta ", true_records[branch]["beta"])
         print_decomposition("delta", true_records[branch]["delta"])
+        print_sign_coherence("sign coherence abs(mean)/rms", true_records[branch])
 
     print("  fixed-prompt content test")
     print_decomposition("gamma", fixed_prompt_records["fixed_label_0"]["gamma"])
     print_decomposition("beta ", fixed_prompt_records["fixed_label_0"]["beta"])
     print_decomposition("delta", fixed_prompt_records["fixed_label_0"]["delta"])
+    print_sign_coherence("sign coherence abs(mean)/rms", fixed_prompt_records["fixed_label_0"])
 
     gamma_prompt_delta = relative_rms_delta(
         prompt_records["label_0"]["gamma"],
@@ -377,12 +410,38 @@ def normalize_map(tensor: torch.Tensor) -> torch.Tensor:
     return ((tensor - low) / (high - low)).clamp(0.0, 1.0)
 
 
+def normalize_signed_map(tensor: torch.Tensor) -> torch.Tensor:
+    tensor = tensor.detach().cpu()
+    scale = torch.quantile(tensor.abs().flatten(), SIGNED_MAP_QUANTILE)
+    if scale.item() <= 1e-12:
+        return torch.zeros_like(tensor)
+    return (tensor / scale).clamp(-1.0, 1.0)
+
+
 def channel_rms_map(tensor: torch.Tensor, count: int) -> torch.Tensor:
     return normalize_map(tensor[:count].square().mean(dim=1, keepdim=True).sqrt())
 
 
-def show_tensor_grid(tensor: torch.Tensor, title: str, name: str, cmap: str = "gray") -> None:
-    tensor = tensor.detach().cpu().clamp(0.0, 1.0)
+def channel_signed_mean_map(tensor: torch.Tensor, count: int) -> torch.Tensor:
+    return normalize_signed_map(tensor[:count].mean(dim=1, keepdim=True))
+
+
+def channel_sign_coherence_map(tensor: torch.Tensor, count: int) -> torch.Tensor:
+    return channel_sign_coherence(tensor[:count]).detach().cpu()
+
+
+def show_tensor_grid(
+        tensor: torch.Tensor,
+        title: str,
+        name: str,
+        cmap: str = "gray",
+        vmin: float = 0.0,
+        vmax: float = 1.0,
+        clamp: bool = True,
+) -> None:
+    tensor = tensor.detach().cpu()
+    if clamp:
+        tensor = tensor.clamp(vmin, vmax)
     batch, channels, _, _ = tensor.shape
     cols = min(batch, 4)
     rows = math.ceil(batch / cols)
@@ -395,9 +454,9 @@ def show_tensor_grid(tensor: torch.Tensor, title: str, name: str, cmap: str = "g
             continue
         image = tensor[idx]
         if channels == 1:
-            ax.imshow(image.squeeze(0), cmap=cmap, vmin=0.0, vmax=1.0)
+            ax.imshow(image.squeeze(0), cmap=cmap, vmin=vmin, vmax=vmax)
         else:
-            ax.imshow(image.permute(1, 2, 0), vmin=0.0, vmax=1.0)
+            ax.imshow(image.permute(1, 2, 0), vmin=vmin, vmax=vmax)
         ax.set_title(str(idx), fontsize=8)
 
     fig.suptitle(title)
@@ -416,24 +475,36 @@ def render_final_block_maps(size: int, image: torch.Tensor, model_input: torch.T
     show_tensor_grid(model_input[:count], f"flow inputs x_t | alpha={ALPHA:.2f} | {size}px", f"xt_{size}")
 
     for branch in ("null", "pos"):
-        show_tensor_grid(
-            channel_rms_map(records[branch]["gamma"], count),
-            f"final FFN gamma RMS map | branch={branch} | {size}px",
-            f"final_gamma_{branch}_{size}",
-            cmap="magma",
-        )
-        show_tensor_grid(
-            channel_rms_map(records[branch]["beta"], count),
-            f"final FFN beta RMS map | branch={branch} | {size}px",
-            f"final_beta_{branch}_{size}",
-            cmap="magma",
-        )
-        show_tensor_grid(
-            channel_rms_map(records[branch]["delta"], count),
-            f"final FFN adaptive delta RMS map | branch={branch} | {size}px",
-            f"final_delta_{branch}_{size}",
-            cmap="magma",
-        )
+        for tensor_name, title_name in (
+                ("gamma", "gamma"),
+                ("beta", "beta"),
+                ("delta", "adaptive delta"),
+        ):
+            tensor = records[branch][tensor_name]
+            if RENDER_RMS_FINAL_BLOCK_MAPS:
+                show_tensor_grid(
+                    channel_rms_map(tensor, count),
+                    f"final FFN {title_name} RMS map | branch={branch} | {size}px",
+                    f"final_{tensor_name}_rms_{branch}_{size}",
+                    cmap="magma",
+                )
+            if RENDER_SIGNED_FINAL_BLOCK_MAPS:
+                show_tensor_grid(
+                    channel_signed_mean_map(tensor, count),
+                    f"final FFN {title_name} signed mean map | branch={branch} | {size}px",
+                    f"final_{tensor_name}_signed_mean_{branch}_{size}",
+                    cmap=SIGNED_MAP_CMAP,
+                    vmin=-1.0,
+                    vmax=1.0,
+                    clamp=False,
+                )
+            if RENDER_COHERENCE_FINAL_BLOCK_MAPS:
+                show_tensor_grid(
+                    channel_sign_coherence_map(tensor, count),
+                    f"final FFN {title_name} sign coherence map | branch={branch} | {size}px",
+                    f"final_{tensor_name}_sign_coherence_{branch}_{size}",
+                    cmap=COHERENCE_MAP_CMAP,
+                )
 
 
 def print_size_report(size: int, full: dict, disabled: dict, stats: list[dict[str, float | str]]) -> None:
@@ -470,6 +541,12 @@ def print_size_report(size: int, full: dict, disabled: dict, stats: list[dict[st
         f"beta={aggregate['beta_spatial_frac']:.3f}, "
         f"delta={aggregate['delta_spatial_frac']:.3f}"
     )
+    print(
+        "  channel sign coherence abs(mean)/rms: "
+        f"gamma={aggregate['gamma_sign_coherence']:.3f}, "
+        f"beta={aggregate['beta_sign_coherence']:.3f}, "
+        f"delta={aggregate['delta_sign_coherence']:.3f}"
+    )
 
 
 # MAIN =================================================================================================================
@@ -484,6 +561,7 @@ def main() -> None:
     print("  useful input-dependence signal: spatial dependence fractions are clearly above 0")
     print("  final-block decomposition: high content fraction means same coordinate differs across images")
     print("  prompt swap delta: high value means same x_t gets different adaptation under different prompts")
+    print("  sign coherence: low abs(channel mean)/channel RMS means strong hidden work cancels in signed averages")
 
     for size in ANALYSIS_SIZES:
         image, labels = load_batch(size, device)
