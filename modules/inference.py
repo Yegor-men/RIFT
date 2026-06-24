@@ -5,10 +5,10 @@ import torch
 from safetensors.torch import load_file
 
 from modules.conditioning import ClassLabelConditioner
-from modules.rift import RIFT
 from modules.render_image import render_image
-from modules.sampling import run_rift_sampling
+from modules.rift import RIFT
 from modules.rift_diffusion import sample_noise
+from modules.sampling import run_rift_sampling
 
 
 def infer_sidecar_path(model_path: Path, suffix: str) -> Path:
@@ -41,6 +41,7 @@ def build_model_from_config(config: dict, device: torch.device):
         block_count=model_config["block_count"],
         pos_freq=model_config["pos_freq"],
         time_freq=model_config["time_freq"],
+        linear_attention=model_config.get("linear_attention", True),
     ).to(device)
     conditioner = ClassLabelConditioner(
         num_classes=model_config["num_classes"],
@@ -54,11 +55,22 @@ def parse_label_list(labels: str, count: int, num_classes: int, device: torch.de
     if labels.strip().lower() == "grid":
         base = torch.arange(min(num_classes, count), dtype=torch.long, device=device)
     else:
-        base = torch.tensor([int(item.strip()) for item in labels.split(",") if item.strip()], dtype=torch.long, device=device)
+        values = [int(item.strip()) for item in labels.split(",") if item.strip()]
+        if not values:
+            raise ValueError("labels must be 'grid' or a comma-separated label list")
+        base = torch.tensor(values, dtype=torch.long, device=device)
     if base.numel() >= count:
         return base[:count]
     repeats = (count + base.numel() - 1) // base.numel()
     return base.repeat(repeats)[:count]
+
+
+def normalize_size(size: int | tuple[int, int]) -> tuple[int, int]:
+    if isinstance(size, int):
+        return size, size
+    if len(size) != 2:
+        raise ValueError(f"size tuples must be (height, width), got {size}")
+    return int(size[0]), int(size[1])
 
 
 @torch.no_grad()
@@ -69,17 +81,19 @@ def render_checkpoint_samples(
         dataset_name: str | None = None,
         conditioner_path: str | Path | None = None,
         config_path: str | Path | None = None,
-        sizes: tuple[int, ...] = (28, 64, 128),
+        sizes: tuple[int | tuple[int, int], ...] = ((128, 128), (160, 160), (192, 192)),
         labels: str = "grid",
         batch_size: int = 100,
         sample_steps: int = 20,
         step_size: float = 0.05,
-        invert_steps: int = 0,
-        condition_strength: float = 1.0,
-        evidence_scale: float = 1.0,
+        cfg_scale: float = 4.0,
+        condition_strength: float | None = None,
         device: str = "cuda",
         save: bool = False,
 ) -> None:
+    if condition_strength is not None:
+        cfg_scale = float(condition_strength)
+
     device_obj = torch.device(device if device != "cuda" or torch.cuda.is_available() else "cpu")
     if model_path is None:
         if model_dir is None:
@@ -99,26 +113,28 @@ def render_checkpoint_samples(
     print(f"Loaded conditioner: {conditioner_path}")
 
     sample_labels = parse_label_list(labels, batch_size, model_config["num_classes"], device_obj)
-    text_conditions = [(conditioner(sample_labels), float(condition_strength))]
+    positive_tokens = conditioner(sample_labels)
+    negative_tokens = conditioner(torch.full_like(sample_labels, model_config["num_classes"]))
 
     for size in sizes:
+        height, width = normalize_size(size)
         initial_noise = sample_noise(
-            (sample_labels.shape[0], model_config["image_channels"], size, size),
+            (sample_labels.shape[0], model_config["image_channels"], height, width),
             device=device_obj,
         )
         samples, _ = run_rift_sampling(
             model=model,
             initial_noise=initial_noise,
-            text_conditions=text_conditions,
+            positive_text_conditioning=positive_tokens,
+            negative_text_conditioning=negative_tokens,
             num_steps=sample_steps,
             step_size=step_size,
-            invert_steps=invert_steps,
-            evidence_scale=evidence_scale,
+            cfg_scale=cfg_scale,
             device=device_obj,
         )
         render_image(
-            samples.clamp(0.0, 1.0),
-            title=f"{title_prefix} RIFT | {size}px",
-            name=f"{title_prefix.lower()}_rift_{size}px",
+            samples,
+            title=f"{title_prefix} pixel RIFT | {height}x{width}",
+            name=f"{title_prefix.lower()}_pixel_rift_{height}x{width}",
             save=save,
         )

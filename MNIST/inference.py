@@ -13,16 +13,14 @@ from modules.inference import render_checkpoint_samples
 MODEL_DIR = Path(__file__).resolve().parent / "models"
 MODEL_PATH = None  # If None, use newest MNIST_E*_rift.safetensors from MODEL_DIR by file modification time.
 CONDITIONER_PATH = None  # If None, inferred from MODEL_PATH.
-CONFIG_PATH = None       # If None, inferred from MODEL_PATH.
+CONFIG_PATH = None  # If None, inferred from MODEL_PATH.
 
-SIZES = (28, 64, 128)
+SIZES = ((14, 14), (64, 64), (128, 128))
 LABELS = "grid"
 BATCH_SIZE = 100
 SAMPLE_STEPS = 20
 STEP_SIZE = 0.05
-INVERT_STEPS = 0
-CONDITION_STRENGTH = 1.0
-EVIDENCE_SCALE = 1.0
+CFG_SCALE = 4.0
 DEVICE = "cuda"
 SAVE_IMAGES = False
 
@@ -42,9 +40,7 @@ def main() -> None:
         batch_size=BATCH_SIZE,
         sample_steps=SAMPLE_STEPS,
         step_size=STEP_SIZE,
-        invert_steps=INVERT_STEPS,
-        condition_strength=CONDITION_STRENGTH,
-        evidence_scale=EVIDENCE_SCALE,
+        cfg_scale=CFG_SCALE,
         device=DEVICE,
         save=SAVE_IMAGES,
     )

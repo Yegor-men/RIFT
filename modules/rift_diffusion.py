@@ -28,58 +28,73 @@ def sample_noise(
     return torch.rand(shape, device=device, dtype=dtype)
 
 
+def sample_alpha(
+        batch_size: int,
+        device: torch.device | str,
+        dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    return torch.rand((batch_size,), device=device, dtype=dtype)
+
+
 def rift_training_pair(
         clean: torch.Tensor,
         alpha: Optional[torch.Tensor | float] = None,
         noise: Optional[torch.Tensor] = None,
         detach_input: bool = True,
 ):
-    """Build a linear-corruption residual-velocity training pair.
+    """Build x_t and target velocity for flow matching.
 
-    x0 is uniform random noise, x1 is the clean image, and xt is a per-image
-    linear interpolation. The target velocity is x1-xt, not x1-x0.
+    clean is x1, noise is x0, alpha is the corruption level, and t = 1 - alpha.
+    The model input is x_t = (1 - alpha) * x1 + alpha * x0.
+    The training target is the constant path velocity v = x1 - x0.
     """
     clean = clean.clamp(0.0, 1.0)
+    batch_size = clean.shape[0]
+
     if noise is None:
         noise = sample_noise_like(clean)
     else:
         noise = noise.to(device=clean.device, dtype=clean.dtype).clamp(0.0, 1.0)
 
     if alpha is None:
-        alpha_map = torch.rand(
-            (clean.shape[0], *([1] * (clean.ndim - 1))),
-            device=clean.device,
-            dtype=clean.dtype,
-        ).clamp_min(1e-6)
+        alpha = sample_alpha(batch_size, clean.device, clean.dtype)
+    elif not torch.is_tensor(alpha):
+        alpha = torch.full((batch_size,), float(alpha), device=clean.device, dtype=clean.dtype)
     else:
-        alpha_map = expand_batch_value(alpha, clean).clamp(0.0, 1.0)
+        alpha = alpha.to(device=clean.device, dtype=clean.dtype).flatten()
+        if alpha.numel() == 1:
+            alpha = alpha.expand(batch_size)
+        if alpha.numel() != batch_size:
+            raise ValueError(f"alpha must have {batch_size} values, got {alpha.numel()}")
 
+    alpha = alpha.clamp(0.0, 1.0)
+    alpha_map = alpha.view(batch_size, 1, 1, 1)
     model_input = ((1.0 - alpha_map) * clean + alpha_map * noise).clamp(0.0, 1.0)
-    target_velocity = clean - model_input
+    target_velocity = noise.neg().add(clean)
+
     if detach_input:
         model_input = model_input.detach()
-    return model_input, target_velocity, noise, alpha_map
+
+    return model_input, target_velocity, noise, alpha
 
 
-def alpha_loss_weights(alpha_map: torch.Tensor, max_weight: float = 100.0, eps: float = 1e-8) -> torch.Tensor:
-    alpha = alpha_map.reshape(alpha_map.shape[0], -1).mean(dim=1)
-    weights = alpha.clamp_min(float(eps)).pow(-2.0)
-    return weights.clamp(max=float(max_weight))
+def velocity_mse_loss(
+        predicted_velocity: torch.Tensor,
+        target_velocity: torch.Tensor,
+        alpha: torch.Tensor | None = None,
+        max_weight: float | None = None,
+) -> torch.Tensor:
+    del alpha, max_weight
+    return torch.nn.functional.mse_loss(predicted_velocity, target_velocity)
 
 
 def weighted_velocity_mse_loss(
         predicted_velocity: torch.Tensor,
         target_velocity: torch.Tensor,
-        alpha_map: torch.Tensor,
-        max_weight: float = 100.0,
+        alpha: torch.Tensor | None = None,
+        max_weight: float | None = None,
 ) -> torch.Tensor:
-    """Per-image alpha^-2 weighted MSE, normalized by total batch weight."""
-    per_image_mse = (predicted_velocity - target_velocity).square().flatten(1).mean(dim=1)
-    weights = alpha_loss_weights(alpha_map, max_weight=max_weight).to(
-        device=per_image_mse.device,
-        dtype=per_image_mse.dtype,
-    )
-    return (per_image_mse * weights).sum() / weights.sum().clamp_min(1e-8)
+    return velocity_mse_loss(predicted_velocity, target_velocity, alpha, max_weight)
 
 
 def rift_velocity_step(
@@ -87,7 +102,7 @@ def rift_velocity_step(
         predicted_velocity: torch.Tensor,
         step_size: float = 0.05,
 ) -> torch.Tensor:
-    """Apply the model-predicted residual velocity in pixel space."""
+    """Euler step along the predicted x1-x0 flow velocity in [0, 1] space."""
     current = current.clamp(0.0, 1.0)
     predicted_velocity = predicted_velocity.to(device=current.device, dtype=current.dtype).clamp(-1.0, 1.0)
     return (current + float(step_size) * predicted_velocity).clamp(0.0, 1.0)
